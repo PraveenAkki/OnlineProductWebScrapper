@@ -1,0 +1,69 @@
+# ImageCompare — All Phases
+# Python 3.10.11
+#
+# ── Install order ────────────────────────────────────────────────
+#
+#  Step 1  PyTorch CPU (run first, separately)
+#          python -m pip install torch==2.3.1+cpu torchvision==0.18.1+cpu \
+#            --index-url https://download.pytorch.org/whl/cpu
+#
+#  Step 2  FashionCLIP (run second, separately)
+#          python -m pip install git+https://github.com/patrickjohncyh/fashion-clip.git
+#
+#  Step 3  Everything else (run from project root)
+#          python -m pip install -r requirements.txt
+#
+# ── Notes ────────────────────────────────────────────────────────
+#
+#  • huggingface-hub and requests are pinned to versions compatible
+#    with transformers 4.41.2 and fashion-clip. If other packages
+#    in your environment depend on newer versions, expect warnings.
+#
+#  • torch and torchvision are installed in Step 1 and are NOT
+#    listed here to avoid pip trying to resolve the +cpu variants
+#    against PyPI. Installed versions: torch 2.3.1+cpu,
+#    torchvision 0.18.1+cpu.
+#
+# ─────────────────────────────────────────────────────────────────
+
+
+# ── Django ───────────────────────────────────────────────────────
+Django==4.2.16
+djangorestframework==3.15.2
+asgiref==3.8.1
+sqlparse==0.5.1
+
+# ── Image handling ───────────────────────────────────────────────
+Pillow==10.4.0
+opencv-python==4.9.0.80
+
+# ── CLIP / FashionCLIP (HuggingFace stack) ───────────────────────
+transformers==4.41.2
+tokenizers==0.19.1
+huggingface-hub==0.23.2
+safetensors==0.4.3
+ftfy==6.2.0
+
+# ── Shared dependencies ──────────────────────────────────────────
+numpy==1.26.4
+regex==2024.5.15
+tqdm==4.66.4
+pyyaml==6.0.1
+packaging==24.1
+filelock==3.14.0
+fsspec==2024.5.0
+typing-extensions==4.12.2
+
+# ── HTTP (requests + its deps) ───────────────────────────────────
+requests==2.31.0
+certifi==2024.7.4
+charset-normalizer==3.3.2
+idna==3.7
+urllib3==2.2.2
+
+# ── Environment ──────────────────────────────────────────────────
+python-dotenv==1.0.1
+
+# Add these to your existing requirements.txt
+beautifulsoup4==4.12.3
+lxml==5.2.2
