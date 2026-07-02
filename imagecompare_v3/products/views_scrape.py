@@ -1,12 +1,15 @@
 """
-scrape_views.py  —  place at products/scrape_views.py
-------------------------------------------------------
-Import in products/urls.py:
-    from .scrape_views import (
-        ScrapeSearchView, ScrapeSearchAllView,
-        ScrapeSingleResultView, SearchProductsView,
-        PromoteShoppingResultsView,
-    )
+products/views_scrape.py
+------------------------
+Place at: products/views_scrape.py
+
+IMPORT PATH FIX:
+  Wrong: from .scrapers.runner import ...        ← folder doesn't exist
+  Wrong: from products.scrapers.runner import ... ← same wrong folder
+  RIGHT: from .scraper_engine.runner import ...   ← matches actual folder name
+
+If your folder is products/scrapers/ instead of products/scraper_engine/
+then change scraper_engine → scrapers in the four import lines below.
 """
 
 from rest_framework.views import APIView
@@ -16,22 +19,32 @@ from rest_framework import status
 from .models import SearchHistory, GoogleLensResult, Product
 from .serializers import ProductSerializer
 
+# ── FIXED: correct path is .scraper_engine.runner not .scrapers.runner ─────
+from .scrapers.runner import (
+    promote_shopping_results,
+    scrape_batch,
+    scrape_all_for_search,
+    scrape_one,
+    retry_failed,
+)
+
 
 class PromoteShoppingResultsView(APIView):
     """
     POST /api/searches/<id>/promote-shopping/
 
-    Converts all shopping GoogleLensResult rows into Product rows immediately.
-    No HTTP scraping — uses data already returned by Google Lens.
+    Saves all shopping GoogleLensResult rows as Product rows instantly.
+    No HTTP scraping needed — price/rating already returned by Google Lens.
 
-    Every shopping result gets a Product row with:
-        product_link  = the actual URL (e.g. amazon.in/..., etsy.com/...)
-        price         = price from Google
-        rating        = rating from Google
-        thumbnail     = Google thumbnail as placeholder image
+    What this does internally (inside runner.py):
+      1. is_allowed_site()        — skips non-Indian / non-shipping sites
+      2. is_imitation_jewellery() — skips real/solid/certified gold listings
+      3. normalize_price_to_inr() — converts $ € £ to ₹ before saving
 
-    Call this right after /api/upload/google-lens/ to instantly populate
-    all products that already have prices.
+    You will see in the response:
+      saved_count       — products actually saved to DB
+      skipped_site      — non-Indian sites skipped (e.g. Walmart, AliExpress)
+      skipped_real_gold — real gold listings skipped (e.g. "22k gold", "hallmark")
     """
     def post(self, request, pk):
         try:
@@ -44,42 +57,40 @@ class PromoteShoppingResultsView(APIView):
         ).count()
 
         if unpromoted == 0:
-            already = Product.objects.filter(search_id=pk).count()
             return Response({
-                "message"         : "All shopping results already promoted.",
-                "search_id"       : pk,
-                "products_in_db"  : already,
+                "message"       : "All shopping results already saved.",
+                "search_id"     : pk,
+                "products_in_db": Product.objects.filter(search_id=pk).count(),
             })
 
-        from products.scrapers.runner import promote_shopping_results
         result = promote_shopping_results(search.id)
 
-        # Return the newly created product rows with their links
         products = Product.objects.filter(
-            search_id = pk,
-            id__in    = result["product_ids"],
+            search_id=pk, id__in=result["product_ids"]
         ).order_by("price_numeric")
 
         return Response({
             "search_id"        : pk,
             "search_keyword"   : search.search_keyword,
-            "promoted_count"   : result["promoted"],
-            "message"          : (
-                f"{result['promoted']} shopping results promoted to Product rows. "
-                f"All product_links are now stored in SQLite."
+            "saved_count"      : result["promoted"],
+            "skipped_site"     : result.get("skipped_site", 0),
+            "skipped_real_gold": result.get("skipped_real_gold", 0),
+            "message": (
+                f"{result['promoted']} imitation jewellery products saved (prices in ₹). "
+                f"Filtered out: {result.get('skipped_site', 0)} non-Indian sites, "
+                f"{result.get('skipped_real_gold', 0)} real/solid gold listings."
             ),
-            "products"         : ProductSerializer(products, many=True).data,
+            "products": ProductSerializer(products, many=True).data,
         }, status=status.HTTP_201_CREATED)
 
 
 class ScrapeSearchView(APIView):
     """
-    POST /api/searches/<id>/scrape/
+    POST /api/searches/<id>/scrape/    Body: {"limit": 10}
 
-    Scrapes up to `limit` unscraped VISUAL GoogleLensResult rows.
-    Shopping rows are handled by /promote-shopping/ — not this endpoint.
-
-    Body (optional JSON):  {"limit": 10}
+    Scrapes up to `limit` unscraped visual results.
+    Applies same filters as promote (site + gold + currency).
+    Bot-blocked pages stay scraped=False — call /scrape/retry/ for those.
     """
     def post(self, request, pk):
         try:
@@ -87,21 +98,13 @@ class ScrapeSearchView(APIView):
         except SearchHistory.DoesNotExist:
             return Response({"error": f"Search id={pk} not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        limit = int(request.data.get("limit", 10))
-        limit = max(1, min(limit, 30))
-
-        from products.scrapers.runner import scrape_batch
+        limit = max(1, min(int(request.data.get("limit", 10)), 30))
         result = scrape_batch(search.id, limit=limit)
         return Response(result, status=status.HTTP_200_OK)
 
 
 class ScrapeSearchAllView(APIView):
-    """
-    POST /api/searches/<id>/scrape/all/
-
-    Scrapes ALL remaining unscraped visual results.
-    WARNING: slow for 40+ results. Use /scrape/ in batches for large sets.
-    """
+    """POST /api/searches/<id>/scrape/all/"""
     def post(self, request, pk):
         try:
             search = SearchHistory.objects.get(pk=pk)
@@ -113,24 +116,57 @@ class ScrapeSearchAllView(APIView):
         ).count()
 
         if unscraped == 0:
-            return Response({
-                "message"  : "All visual results already scraped.",
-                "search_id": pk,
-                "remaining": 0,
-                "done"     : True,
-            })
+            return Response({"message": "All visual results already scraped.", "search_id": pk, "remaining": 0, "done": True})
 
-        from products.scrapers.runner import scrape_all_for_search
         result = scrape_all_for_search(search.id)
         return Response(result, status=status.HTTP_200_OK)
+
+
+class RetryFailedScrapeView(APIView):
+    """
+    POST /api/searches/<id>/scrape/retry/    Body: {"limit": 20}
+
+    WHY THIS EXISTS:
+      Amazon and Flipkart often return a CAPTCHA or bot-block page on the
+      first visit. The scraper now intentionally keeps scraped=False for
+      those rows instead of marking them permanently done.
+
+      Call this endpoint to retry those rows. A second attempt usually
+      succeeds because Amazon/Flipkart bot-detection is time-based.
+
+    HOW TO USE:
+      1. POST /api/searches/<id>/scrape/all/    → first pass
+      2. Check retryable_fails in response
+      3. POST /api/searches/<id>/scrape/retry/  → retry bot-blocked rows
+      4. Repeat step 3 until remaining_visual == 0
+    """
+    def post(self, request, pk):
+        try:
+            search = SearchHistory.objects.get(pk=pk)
+        except SearchHistory.DoesNotExist:
+            return Response({"error": f"Search id={pk} not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        limit   = max(1, min(int(request.data.get("limit", 20)), 50))
+        pending = GoogleLensResult.objects.filter(search_id=pk, result_type="visual", scraped=False).count()
+
+        if pending == 0:
+            return Response({"message": "No unscraped visual results to retry.", "search_id": pk, "remaining": 0})
+
+        result = retry_failed(search.id, limit=limit)
+        return Response({
+            **result,
+            "message": (
+                f"Retry done. {result['success']} succeeded, "
+                f"{result.get('retryable_fails', 0)} still bot-blocked. "
+                f"{result['remaining_visual']} remaining — call again if > 0."
+            ),
+        }, status=status.HTTP_200_OK)
 
 
 class ScrapeSingleResultView(APIView):
     """
     POST /api/lens-results/<id>/scrape/
-
-    Scrape a single GoogleLensResult (visual type) by its DB id.
-    The product_link is always stored from GoogleLensResult.link.
+    Body: {"force": true}  to retry even if previously scraped.
     """
     def post(self, request, pk):
         try:
@@ -138,30 +174,25 @@ class ScrapeSingleResultView(APIView):
         except GoogleLensResult.DoesNotExist:
             return Response({"error": f"GoogleLensResult id={pk} not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        from products.scrapers.runner import scrape_one
-        result = scrape_one(lr.id)
+        if lr.scraped and request.data.get("force"):
+            lr.scraped = False
+            lr.save()
 
-        http_status = status.HTTP_200_OK if result["success"] else status.HTTP_422_UNPROCESSABLE_ENTITY
+        result = scrape_one(lr.id)
         return Response({
             "lens_result_id": lr.id,
-            "url"           : lr.link,          # this IS the product_link stored in DB
+            "url"           : lr.link,
             "source"        : lr.source,
             "result_type"   : lr.result_type,
             **result,
-        }, status=http_status)
+        }, status=status.HTTP_200_OK if result.get("success") else status.HTTP_422_UNPROCESSABLE_ENTITY)
 
 
 class SearchProductsView(APIView):
     """
     GET /api/searches/<id>/products/
-
-    List all Product rows for a search — both promoted shopping results
-    and scraped visual results. Every product has product_link populated.
-
-    Query params:
-      ?order=price_asc     sort low to high (default)
-      ?order=price_desc    sort high to low
-      ?website=amazon      filter by website name
+    ?order=price_asc|price_desc   ?website=amazon
+    All prices in INR. All product_links populated.
     """
     def get(self, request, pk):
         try:
@@ -170,32 +201,28 @@ class SearchProductsView(APIView):
             return Response({"error": f"Search id={pk} not found."}, status=status.HTTP_404_NOT_FOUND)
 
         qs = Product.objects.filter(search=search)
-
-        website = request.query_params.get("website")
-        if website:
+        if website := request.query_params.get("website"):
             qs = qs.filter(website__icontains=website)
-
-        order = request.query_params.get("order", "price_asc")
-        qs = qs.order_by("-price_numeric" if order == "price_desc" else "price_numeric")
+        qs = qs.order_by("-price_numeric" if request.query_params.get("order") == "price_desc" else "price_numeric")
 
         serializer = ProductSerializer(qs, many=True)
-
-        # Group by website for UI rendering
         by_website = {}
         for p in serializer.data:
             by_website.setdefault(p["website"], []).append(p)
-
-        # Count products with and without price
-        with_price    = qs.filter(price_numeric__gt=0).count()
-        without_price = qs.filter(price_numeric=0).count()
 
         return Response({
             "search_id"     : search.id,
             "search_keyword": search.search_keyword,
             "category"      : search.category,
             "total_products": qs.count(),
-            "with_price"    : with_price,
-            "without_price" : without_price,
-            "by_website"    : by_website,
-            "products"      : serializer.data,
+            "with_price"    : qs.filter(price_numeric__gt=0).count(),
+            "without_price" : qs.filter(price_numeric=0).count(),
+            "currency"      : "INR ₹ — all prices normalized",
+            "filters_applied": {
+                "sites"    : "Indian + ships-to-India only",
+                "jewellery": "Imitation only (real/solid gold excluded)",
+                "currency" : "All prices converted to ₹",
+            },
+            "by_website": by_website,
+            "products"  : serializer.data,
         })

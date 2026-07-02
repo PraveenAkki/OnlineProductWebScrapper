@@ -810,7 +810,8 @@ function renderProducts(prods) {
   const lo=prices.length?Math.min(...prices):null, hi=prices.length?Math.max(...prices):null;
   document.getElementById('product-grid-view').innerHTML=f.map(p=>{
     const iL=lo!==null&&p.price_numeric===lo&&p.price_numeric>0, iH=hi!==null&&p.price_numeric===hi&&p.price_numeric>0&&prices.length>1;
-    const th=p.thumbnail||p.image||''; const site=p.website||getDomain(p.product_link||'')||'—';
+    const th=p.thumbnail||p.image||p.image_url||p.thumbnail_url||p.product_image||p.img||p.picture||'';
+    const site=p.website||getDomain(p.product_link||'')||'—';
     return `<div class="product-card">
       <div>${th?`<img class="product-img" src="${th}" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">`:''}
       <div class="product-img-placeholder" style="${th?'display:none':''}">🛍</div></div>
@@ -829,9 +830,10 @@ function renderProducts(prods) {
   }).join('');
   document.getElementById('product-table-body').innerHTML=f.map(p=>{
     const iL=lo!==null&&p.price_numeric===lo&&p.price_numeric>0, iH=hi!==null&&p.price_numeric===hi&&p.price_numeric>0&&prices.length>1;
+    const th=p.thumbnail||p.image||p.image_url||p.thumbnail_url||p.product_image||p.img||p.picture||'';
     return `<tr class="${iL?'highlight-green':iH?'highlight-red':''}">
       <td style="max-width:240px"><div style="display:flex;align-items:center;gap:8px">
-        ${p.thumbnail?`<img src="${p.thumbnail}" style="width:36px;height:36px;object-fit:cover;border-radius:6px;border:1px solid var(--border)">`:`<div style="width:36px;height:36px;background:var(--bg);border-radius:6px;display:flex;align-items:center;justify-content:center">🛍</div>`}
+        ${th?`<img src="${th}" style="width:36px;height:36px;object-fit:cover;border-radius:6px;border:1px solid var(--border)" onerror="this.style.display='none'">`:`<div style="width:36px;height:36px;background:var(--bg);border-radius:6px;display:flex;align-items:center;justify-content:center">🛍</div>`}
         <span style="font-size:13px">${p.title||'—'}</span></div></td>
       <td>${p.website||getDomain(p.product_link||'')||'—'}</td>
       <td style="font-weight:${iL||iH?'600':'400'}">${fmtPrice(p.price||p.price_numeric)}</td>

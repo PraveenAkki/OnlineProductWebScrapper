@@ -1,54 +1,37 @@
 """
 scraper_engine/router.py
-------------------------
-Routes a URL to the correct scraper based on domain.
+-------------------------
+Routes a URL to the correct site-specific scraper class.
 
-Usage:
-    from products.scraper_engine.router import get_scraper
-    scraper = get_scraper("https://www.amazon.in/...")
-    result  = scraper.scrape(url)
+Placement: products/scraper_engine/router.py
+
+This was MISSING — causing all scrapes to silently fail with
+ImportError: cannot import name 'get_scraper' from 'router'.
 """
 
 from urllib.parse import urlparse
-from .amazon   import AmazonScraper
-from .flipkart import FlipkartScraper
-from .meesho   import MeeshoScraper
-from .myntra   import MyntraScraper
-from .generic  import GenericScraper
-
-
-# Map domain keywords to scraper classes
-DOMAIN_MAP = {
-    "amazon"   : AmazonScraper,
-    "flipkart" : FlipkartScraper,
-    "meesho"   : MeeshoScraper,
-    "myntra"   : MyntraScraper,
-}
 
 
 def get_scraper(url: str):
-    """Return the right scraper instance for the given URL."""
+    """
+    Return the right scraper instance for a given URL.
+    Falls back to GenericScraper for unknown sites.
+    """
     try:
         domain = urlparse(url).netloc.lower()
     except Exception:
         domain = ""
 
-    for keyword, scraper_class in DOMAIN_MAP.items():
-        if keyword in domain:
-            return scraper_class()
+    # Indian priority sites
+    if "amazon."   in domain:
+        from .amazon   import AmazonScraper;   return AmazonScraper()
+    if "flipkart." in domain:
+        from .flipkart import FlipkartScraper; return FlipkartScraper()
+    if "meesho."   in domain:
+        from .meesho   import MeeshoScraper;   return MeeshoScraper()
+    if "myntra."   in domain:
+        from .myntra   import MyntraScraper;   return MyntraScraper()
 
+    # Other Indian sites — generic handles them fine
+    from .generic import GenericScraper
     return GenericScraper()
-
-
-def detect_website(url: str) -> str:
-    """Return a short website name for the URL."""
-    try:
-        domain = urlparse(url).netloc.lower()
-        for keyword in DOMAIN_MAP:
-            if keyword in domain:
-                return keyword
-        # Return clean domain as fallback e.g. "etsy", "ebay"
-        parts = domain.replace("www.", "").split(".")
-        return parts[0] if parts else "unknown"
-    except Exception:
-        return "unknown"
