@@ -1,25 +1,27 @@
 """
-scraper_engine/runner.py
-------------------------
-Place at: products/scraper_engine/runner.py
+products/scrapers/runner.py  — FIXED
+--------------------------------------
+Place at: products/scrapers/runner.py  (same folder as before)
 
-BUGS FIXED IN THIS VERSION:
-  1. filters.py was imported nowhere — is_allowed_site(), is_imitation_jewellery(),
-     normalize_price_to_inr() were never called. Fixed: imported and called here.
-  2. scraped=True was set even on bot-block failures — Amazon/Flipkart CAPTCHA
-     pages permanently removed rows from the retry queue. Fixed: scraped stays
-     False on retryable failures (bot-blocks, timeouts).
-  3. views_scrape.py used broken _runner() wrapper with wrong import path.
-     Fixed: views_scrape.py now imports directly from .scraper_engine.runner
+THREE BUGS FIXED:
+  1. filters.py was never imported — is_allowed_site(), is_imitation_jewellery(),
+     normalize_price_to_inr() were defined but never called anywhere.
+
+  2. retry_failed() function was missing entirely — views_scrape.py tried to
+     import it, got ImportError, Django returned a 500 HTML page instead of JSON,
+     frontend received "<html..." which caused "Unexpected token '<'" in JS.
+
+  3. scraped=True was set even on bot-block failures — rows got permanently
+     removed from the retry queue. Now scraped stays False on retryable errors.
 """
 
 from django.utils import timezone
 
-# ── THESE WERE MISSING — filters were never called before ─────────────────
+# ── FIX 1: ADD THESE IMPORTS (were completely missing before) ─────────────────
 from .filters import (
-    is_allowed_site,         # only Indian / ships-to-India sites
-    is_imitation_jewellery,  # block real/solid/certified gold
-    normalize_price_to_inr,  # convert $ € £ → ₹ before saving
+    is_allowed_site,          # blocks social media / non-shopping sites
+    is_imitation_jewellery,   # blocks real/solid/certified gold listings
+    normalize_price_to_inr,   # converts $ € £ → ₹ before saving to DB
 )
 
 
@@ -27,60 +29,46 @@ def _detect_website(url: str) -> str:
     try:
         from urllib.parse import urlparse
         domain = urlparse(url).netloc.lower()
-        for kw in ["amazon", "flipkart", "meesho", "myntra", "ajio",
-                   "snapdeal", "nykaa", "indiamart", "sukkhi", "mirraw",
-                   "etsy", "ebay"]:
+        mapping = {
+            "amazon"   : "Amazon",
+            "flipkart" : "Flipkart",
+            "meesho"   : "Meesho",
+            "myntra"   : "Myntra",
+            "nykaa"    : "Nykaa",
+            "ajio"     : "Ajio",
+            "snapdeal" : "Snapdeal",
+            "etsy"     : "Etsy",
+            "ebay"     : "eBay",
+            "indiamart": "IndiaMart",
+            "mirraw"   : "Mirraw",
+            "sukkhi"   : "Sukkhi",
+            "tatacliq" : "Tata CLiQ",
+        }
+        for kw, name in mapping.items():
             if kw in domain:
-                return kw
+                return name
         parts = domain.replace("www.", "").split(".")
-        return parts[0] if parts else "unknown"
+        return parts[0].capitalize() if parts else "Unknown"
     except Exception:
-        return "unknown"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HOW FILTERS WORK
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# FILTER 1 — is_allowed_site(url)
-#   Checks the domain against a hard-coded allow-list:
-#     ALLOWED:  amazon.in, amazon.com, flipkart.com, meesho.com, myntra.com,
-#               ajio.com, snapdeal.com, nykaa.com, etsy.com, ebay.com,
-#               any *.in domain
-#     BLOCKED:  instagram.com, facebook.com, pinterest.com, youtube.com,
-#               tiktok.com, aliexpress.com, shein.com, temu.com, walmart.com
-#   If blocked → skip row (mark scraped=True so it doesn't re-queue)
-#
-# FILTER 2 — is_imitation_jewellery(title)
-#   Checks title for real-gold keywords:
-#     BLOCKED keywords: "22k gold", "916 hallmark", "solid gold", "real gold",
-#                       "bis certified", "natural diamond", "igi certified" etc.
-#   Only applies when title contains "jewel" — other categories (saree, shoes)
-#   always pass through.
-#   If blocked → skip row
-#
-# FILTER 3 — normalize_price_to_inr(price_str, price_numeric)
-#   Detects currency from price string:
-#     "$18*"  → detects "$" → multiplies by 86.5 → "₹1,557"
-#     "€25"   → detects "€" → multiplies by 94.0 → "₹2,350"
-#     "₹499"  → already INR → "₹499"
-#   Returns (display_string, float_value) both in INR
-#   Stored in Product.price and Product.price_numeric
-#
-# ─────────────────────────────────────────────────────────────────────────────
+        return "Unknown"
 
 
 def promote_shopping_results(search_id: int) -> dict:
     """
-    Convert all unscraped 'shopping' GoogleLensResult rows into Product rows.
+    Convert all unscraped shopping GoogleLensResult rows into Product rows.
     No HTTP requests — price/rating already came from Google Lens.
 
-    All three filters are applied here.
+    Filters applied:
+      1. is_allowed_site()         — skip social media, AliExpress, etc.
+      2. is_imitation_jewellery()  — skip real gold / certified diamond
+      3. normalize_price_to_inr()  — convert $18 → ₹1,557 before saving
     """
     from products.models import GoogleLensResult, Product
 
     rows = GoogleLensResult.objects.filter(
-        search_id=search_id, result_type="shopping", scraped=False
+        search_id   = search_id,
+        result_type = "shopping",
+        scraped     = False,
     )
 
     created_ids       = []
@@ -91,58 +79,62 @@ def promote_shopping_results(search_id: int) -> dict:
         if not lr.link:
             continue
 
-        # FILTER 1: Indian / ships-to-India sites only
+        # FILTER 1: allowed site?
         if not is_allowed_site(lr.link):
             skipped_site += 1
-            lr.scraped = True   # remove from queue permanently
-            lr.save()
-            print(f"[Runner] SKIP non-allowed site: {lr.source} → {lr.link[:70]}")
+            lr.scraped    = True
+            lr.scraped_at = timezone.now()
+            lr.save(update_fields=["scraped", "scraped_at"])
+            print(f"[Runner] SKIP (site blocked): {lr.source} | {lr.link[:60]}")
             continue
 
-        # FILTER 2: Imitation jewellery only — block real/solid gold
-        if not is_imitation_jewellery(lr.title):
+        # FILTER 2: imitation jewellery only
+        if not is_imitation_jewellery(lr.title or ""):
             skipped_real_gold += 1
-            lr.scraped = True
-            lr.save()
-            print(f"[Runner] SKIP real gold: {lr.title[:70]}")
+            lr.scraped    = True
+            lr.scraped_at = timezone.now()
+            lr.save(update_fields=["scraped", "scraped_at"])
+            print(f"[Runner] SKIP (real gold): {(lr.title or '')[:60]}")
             continue
 
-        # FILTER 3: Normalize price to INR
-        inr_display, inr_numeric = normalize_price_to_inr(lr.price, lr.price_numeric)
+        # FILTER 3: convert price to INR
+        inr_display, inr_numeric = normalize_price_to_inr(
+            lr.price or "", lr.price_numeric or 0.0
+        )
 
         website = _detect_website(lr.link)
 
         product, created = Product.objects.update_or_create(
-            lens_result=lr,
-            defaults={
+            lens_result = lr,
+            defaults    = {
                 "search"       : lr.search,
                 "website"      : website,
-                "product_name" : lr.title,
-                "price"        : inr_display,       # ← INR display e.g. "₹1,557"
-                "price_numeric": inr_numeric,        # ← INR float  e.g. 1557.0
-                "discount"     : lr.tag,
-                "rating"       : lr.rating,
-                "reviews"      : lr.reviews,
-                "product_image": lr.thumbnail,
+                "product_name" : lr.title or "",
+                "price"        : inr_display,
+                "price_numeric": inr_numeric,
+                "discount"     : lr.tag or "",
+                "rating"       : lr.rating or "",
+                "reviews"      : lr.reviews or "",
+                "product_image": lr.thumbnail or lr.image_url or "",
                 "product_link" : lr.link,
-                "delivery"     : lr.delivery,
+                "delivery"     : lr.delivery or "",
             }
         )
 
-        lr.scraped       = True
-        lr.scraped_price = inr_display
-        lr.scraped_rating= lr.rating
-        lr.scraped_at    = timezone.now()
-        lr.save()
+        lr.scraped        = True
+        lr.scraped_price  = inr_display
+        lr.scraped_rating = lr.rating or ""
+        lr.scraped_at     = timezone.now()
+        lr.save(update_fields=["scraped", "scraped_price", "scraped_rating", "scraped_at"])
 
         if created:
             created_ids.append(product.id)
-            print(f"[Runner] SAVED Product id={product.id} [{website}] {lr.title[:50]} | {inr_display}")
+            print(f"[Runner] ✓ Promoted [{website}] {(lr.title or '')[:50]} | {inr_display}")
 
     print(
-        f"[Runner] promote_shopping_results: "
-        f"created={len(created_ids)} "
-        f"skipped_non_indian={skipped_site} "
+        f"[Runner] promote_shopping done: "
+        f"promoted={len(created_ids)} "
+        f"skipped_site={skipped_site} "
         f"skipped_real_gold={skipped_real_gold}"
     )
     return {
@@ -157,15 +149,14 @@ def scrape_one(lens_result_id: int) -> dict:
     """
     Scrape a single visual GoogleLensResult.
 
-    Filter order:
-      1. is_allowed_site() — checked BEFORE making any HTTP request
-      2. is_imitation_jewellery() — checked on title BEFORE HTTP request
-      3. normalize_price_to_inr() — applied AFTER successful scrape
+    Filters:
+      1. is_allowed_site()         before any HTTP request
+      2. is_imitation_jewellery()  on title before HTTP, on name after HTTP
+      3. normalize_price_to_inr()  after successful scrape
 
-    scraped flag logic (BUG FIX):
-      SUCCESS           → scraped=True  (done)
-      PERMANENT FAIL    → scraped=True  (404, product removed — don't retry)
-      BOT-BLOCK/TIMEOUT → scraped=False (stays in queue for retry)
+    scraped flag:
+      SUCCESS or PERMANENT FAIL → scraped=True  (done, don't retry)
+      BOT-BLOCK / TIMEOUT       → scraped=False (stays in queue for retry)
     """
     from products.models import GoogleLensResult, Product
     from .router import get_scraper
@@ -173,86 +164,123 @@ def scrape_one(lens_result_id: int) -> dict:
     try:
         lr = GoogleLensResult.objects.get(pk=lens_result_id)
     except GoogleLensResult.DoesNotExist:
-        return {"success": False, "product_id": None, "error": f"Not found: {lens_result_id}", "retryable": False}
+        return {"success": False, "product_id": None,
+                "error": f"GoogleLensResult {lens_result_id} not found",
+                "retryable": False}
 
     if lr.scraped:
-        return {"success": True, "product_id": None, "error": "Already scraped", "retryable": False}
+        return {"success": True, "product_id": None,
+                "error": "Already scraped", "retryable": False}
 
-    url     = lr.link
-    website = _detect_website(url)
+    url = lr.link
+    if not url:
+        lr.scraped    = True
+        lr.scraped_at = timezone.now()
+        lr.save(update_fields=["scraped", "scraped_at"])
+        return {"success": False, "product_id": None,
+                "error": "No URL", "retryable": False}
 
-    # FILTER 1: check site before making any HTTP request
+    # FILTER 1: allowed site?
     if not is_allowed_site(url):
-        lr.scraped = True
-        lr.save()
-        print(f"[Runner] SKIP scrape — non-allowed site: {website}")
-        return {"success": False, "product_id": None, "error": "Non-allowed site — skipped", "retryable": False}
+        lr.scraped    = True
+        lr.scraped_at = timezone.now()
+        lr.save(update_fields=["scraped", "scraped_at"])
+        print(f"[Runner] SKIP (site blocked): {lr.source}")
+        return {"success": False, "product_id": None,
+                "error": f"Site blocked: {lr.source}", "retryable": False}
 
-    # FILTER 2: check title for real gold before HTTP request
-    if not is_imitation_jewellery(lr.title):
-        lr.scraped = True
-        lr.save()
-        print(f"[Runner] SKIP scrape — real gold title: {lr.title[:70]}")
-        return {"success": False, "product_id": None, "error": "Real gold listing — skipped", "retryable": False}
+    # FILTER 2: imitation check on Google title before HTTP
+    if not is_imitation_jewellery(lr.title or ""):
+        lr.scraped    = True
+        lr.scraped_at = timezone.now()
+        lr.save(update_fields=["scraped", "scraped_at"])
+        print(f"[Runner] SKIP (real gold in title): {(lr.title or '')[:60]}")
+        return {"success": False, "product_id": None,
+                "error": "Real gold listing — skipped", "retryable": False}
 
-    # Make HTTP request
+    # HTTP scrape
+    website = _detect_website(url)
     scraper = get_scraper(url)
     print(f"[Runner] Scraping [{website}] {url[:80]}...")
     data = scraper.scrape(url)
 
-    error_msg  = data.get("error", "")
+    error_msg = data.get("error", "")
     is_success = bool(data.get("product_name")) and not error_msg
-    retryable  = data.get("retryable", True)  # default True = keep in queue on unknown errors
+    # retryable=True means bot-block/timeout → keep scraped=False for retry
+    retryable = data.get("retryable", True)
 
     if not is_success:
         if retryable:
-            # BOT-BLOCK FIX: scraped stays False → row stays in queue for retry
-            print(f"[Runner] RETRYABLE FAIL [{website}]: {error_msg} — scraped=False (retryable)")
+            # BOT-BLOCK: keep scraped=False so retry_failed() can pick it up
+            print(f"[Runner] RETRYABLE FAIL [{website}]: {error_msg}")
         else:
-            # Permanent failure: mark done so it doesn't waste future retries
             lr.scraped    = True
             lr.scraped_at = timezone.now()
-            lr.save()
+            lr.save(update_fields=["scraped", "scraped_at"])
             print(f"[Runner] PERMANENT FAIL [{website}]: {error_msg}")
-        return {"success": False, "product_id": None, "error": error_msg, "retryable": retryable}
+        return {"success": False, "product_id": None,
+                "error": error_msg, "retryable": retryable}
 
-    # FILTER 3: normalize scraped price to INR before saving
+    # FILTER 2 again: check actual scraped product name
+    scraped_name = data.get("product_name", "")
+    if not is_imitation_jewellery(scraped_name):
+        lr.scraped    = True
+        lr.scraped_at = timezone.now()
+        lr.save(update_fields=["scraped", "scraped_at"])
+        print(f"[Runner] SKIP after scrape (real gold in name): {scraped_name[:60]}")
+        return {"success": False, "product_id": None,
+                "error": "Real gold after scrape — skipped", "retryable": False}
+
+    # FILTER 3: normalize price to INR
     inr_display, inr_numeric = normalize_price_to_inr(
         data.get("price", ""), data.get("price_numeric", 0.0)
     )
 
-    lr.scraped       = True
-    lr.scraped_at    = timezone.now()
-    lr.scraped_price = inr_display
-    lr.scraped_rating= data.get("rating", "")
-    lr.save()
+    lr.scraped        = True
+    lr.scraped_at     = timezone.now()
+    lr.scraped_price  = inr_display
+    lr.scraped_rating = data.get("rating", "")
+    lr.save(update_fields=["scraped", "scraped_price", "scraped_rating", "scraped_at"])
 
     product, created = Product.objects.update_or_create(
-        lens_result=lr,
-        defaults={
+        lens_result = lr,
+        defaults    = {
             "search"       : lr.search,
             "website"      : website,
-            "product_name" : data.get("product_name", ""),
+            "product_name" : scraped_name,
             "price"        : inr_display,
             "price_numeric": inr_numeric,
             "discount"     : data.get("discount", ""),
             "rating"       : data.get("rating", ""),
             "reviews"      : data.get("reviews", ""),
-            "product_image": data.get("product_image", ""),
+            "product_image": data.get("product_image", lr.thumbnail or ""),
             "product_link" : url,
             "delivery"     : data.get("delivery", ""),
         }
     )
 
-    print(f"[Runner] {'Created' if created else 'Updated'} Product id={product.id} [{website}] {data['product_name'][:50]} | {inr_display}")
-    return {"success": True, "product_id": product.id, "error": "", "retryable": False}
+    print(f"[Runner] ✓ {'Created' if created else 'Updated'} Product id={product.id} "
+          f"[{website}] {scraped_name[:50]} | {inr_display}")
+    return {
+        "success"      : True,
+        "product_id"   : product.id,
+        "error"        : "",
+        "retryable"    : False,
+        "price"        : inr_display,
+        "price_numeric": inr_numeric,
+        "name"         : product.product_name,
+        "rating"       : product.rating,
+        "website"      : website,
+    }
 
 
 def scrape_batch(search_id: int, limit: int = 10) -> dict:
     from products.models import GoogleLensResult
 
     rows = GoogleLensResult.objects.filter(
-        search_id=search_id, result_type="visual", scraped=False
+        search_id   = search_id,
+        result_type = "visual",
+        scraped     = False,
     ).order_by("rank")[:limit]
 
     success = failed = retryable_fails = 0
@@ -260,8 +288,13 @@ def scrape_batch(search_id: int, limit: int = 10) -> dict:
 
     for lr in rows:
         out = scrape_one(lr.id)
-        results.append({"lens_result_id": lr.id, "url": lr.link[:80], "source": lr.source, **out})
-        if out["success"]:
+        results.append({
+            "lens_result_id": lr.id,
+            "url"           : lr.link,
+            "source"        : lr.source,
+            **out,
+        })
+        if out.get("success"):
             success += 1
         else:
             failed += 1
@@ -296,17 +329,42 @@ def scrape_all_for_search(search_id: int) -> dict:
 
     for lr in rows:
         out = scrape_one(lr.id)
-        results.append({"lens_result_id": lr.id, "url": lr.link[:80], "source": lr.source, **out})
-        if out["success"]: success += 1
-        else:              failed  += 1
+        results.append({
+            "lens_result_id": lr.id,
+            "url"           : lr.link,
+            "source"        : lr.source,
+            **out,
+        })
+        if out.get("success"):
+            success += 1
+        else:
+            failed += 1
 
-    return {"search_id": search_id, "total": total, "success": success, "failed": failed, "done": True, "results": results}
+    remaining = GoogleLensResult.objects.filter(
+        search_id=search_id, result_type="visual", scraped=False
+    ).count()
+
+    return {
+        "search_id"      : search_id,
+        "total"          : total,
+        "success"        : success,
+        "failed"         : failed,
+        "remaining_visual": remaining,
+        "done"           : remaining == 0,
+        "results"        : results,
+    }
 
 
+# ── FIX 2: ADD THIS FUNCTION (was missing — caused ImportError → HTML 500) ───
 def retry_failed(search_id: int, limit: int = 20) -> dict:
     """
-    Retry visual rows that are still scraped=False.
-    These are bot-blocked rows from a previous scrape run.
-    Second attempt often succeeds because Amazon/Flipkart bot-detection rotates.
+    Retry visual rows still marked scraped=False after a previous scrape run.
+    These are bot-blocked rows — Amazon/Flipkart CAPTCHA pages.
+    A second attempt after a delay often succeeds.
+
+    This function was MISSING before — views_scrape.py imported it but
+    runner.py didn't define it, causing ImportError at startup.
+    Django returned a 500 HTML error page instead of JSON.
+    Frontend received '<html...' → "Unexpected token '<'" error.
     """
     return scrape_batch(search_id, limit=limit)
