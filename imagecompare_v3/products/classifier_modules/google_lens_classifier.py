@@ -133,6 +133,62 @@ def _upload_to_tmpfiles(image_path: str) -> str:
     return direct_url
 
 
+def _get_own_site_public_url(image_path: str) -> str:
+    """
+    Build a public URL for the ALREADY-UPLOADED image using this app's own
+    live domain, instead of re-uploading it to a third-party temp host.
+
+    WHY: catbox.moe and tmpfiles.org both block/reject requests coming from
+    known cloud & datacenter IP ranges as an anti-abuse measure — Render's
+    outbound IPs fall into that bucket, which is exactly why you're seeing
+    catbox.moe respond with "HTTP 412: Invalid uploader" and tmpfiles.org
+    silently serving HTML instead of the file. That's a third-party policy,
+    not something fixable from our side by retrying or switching hosts.
+
+    Since this app is already deployed and publicly reachable on Render, and
+    Django already serves uploaded files under MEDIA_URL, the file at
+    `image_path` (under MEDIA_ROOT) is very likely ALREADY reachable at a
+    public URL on your own domain — no third-party host needed at all.
+
+    Uses (in order):
+      - PUBLIC_SITE_URL env var / Django setting, if you want to set it
+        explicitly (e.g. for a custom domain), OR
+      - RENDER_EXTERNAL_URL — Render sets this automatically for every web
+        service (e.g. "https://your-app.onrender.com"), no config needed.
+
+    Returns "" if no usable base URL is configured, or if image_path isn't
+    under MEDIA_ROOT — callers should fall back to third-party hosts in
+    that case, same as before.
+
+    NOTE: this only works if MEDIA_URL is actually being served publicly in
+    production (e.g. via whitenoise, a urls.py static() route enabled
+    outside DEBUG, or cloud storage like S3). If your uploads aren't
+    reachable at <domain><MEDIA_URL><path> in a browser, this will
+    correctly fail verification and fall back automatically — it won't
+    silently break anything.
+    """
+    from django.conf import settings
+
+    base_url = (
+        getattr(settings, "PUBLIC_SITE_URL", "")
+        or os.environ.get("PUBLIC_SITE_URL", "")
+        or os.environ.get("RENDER_EXTERNAL_URL", "")
+    )
+    if not base_url:
+        return ""
+    base_url = base_url.rstrip("/")
+
+    media_root = os.path.abspath(str(getattr(settings, "MEDIA_ROOT", "")))
+    media_url  = getattr(settings, "MEDIA_URL", "/media/")
+    abs_path   = os.path.abspath(image_path)
+
+    if not media_root or not abs_path.startswith(media_root):
+        return ""
+
+    rel_path = os.path.relpath(abs_path, media_root).replace(os.sep, "/")
+    return f"{base_url}/{media_url.strip('/')}/{rel_path}"
+
+
 def _upload_to_catbox(image_path: str) -> str:
     """
     Upload local image -> catbox.moe -> return direct file URL.
@@ -407,32 +463,49 @@ def classify(image_path: str) -> dict:
         return _error("SERPAPI_KEY not configured. Add to .env: SERPAPI_KEY=your_key")
 
     # Step 1: Upload image to a public host Google Lens can fetch, and
-    # verify it actually serves real image content. catbox.moe is now tried
-    # FIRST (tmpfiles.org has been intermittently returning an HTML page
-    # instead of the raw file on its direct /dl/ link, which silently
-    # breaks Google Lens). tmpfiles.org is kept as a fallback in case
-    # catbox.moe itself is ever unreachable, rather than removing it
-    # outright.
+    # verify it actually serves real image content.
+    #
+    # We try our OWN site's public media URL FIRST (via RENDER_EXTERNAL_URL
+    # or PUBLIC_SITE_URL) — since the app is already publicly hosted, this
+    # sidesteps catbox.moe/tmpfiles.org entirely, along with their
+    # anti-abuse blocks on cloud/datacenter IPs (Render included), which is
+    # what "catbox.moe HTTP 412: Invalid uploader" and tmpfiles.org's
+    # HTML-instead-of-file responses are. Only if that's unavailable or
+    # unreachable do we fall back to catbox.moe, then tmpfiles.org.
     public_url = None
     upload_errors = []
-    for host_name, upload_fn in (
-        ("catbox.moe", _upload_to_catbox),
-        ("tmpfiles.org", _upload_to_tmpfiles),
-    ):
+
+    own_url = _get_own_site_public_url(image_path)
+    if own_url:
         try:
-            candidate_url = upload_fn(image_path)
+            _verify_public_image_url(own_url)
+            public_url = own_url
+            print(f"[GoogleLens] Using own site's public media URL (no third-party host needed): {own_url}")
         except Exception as e:
-            upload_errors.append(f"{host_name} upload failed: {e}")
-            print(f"[GoogleLens] {host_name} upload failed: {e}")
-            continue
-        try:
-            _verify_public_image_url(candidate_url)
-            public_url = candidate_url
-            break
-        except Exception as e:
-            upload_errors.append(f"{host_name}: {e}")
-            print(f"[GoogleLens] {host_name} URL failed verification ({e}); trying next host if available...")
-            continue
+            upload_errors.append(f"own site URL ({own_url}): {e}")
+            print(f"[GoogleLens] Own site URL failed verification ({e}); falling back to third-party hosts...")
+    else:
+        print("[GoogleLens] No PUBLIC_SITE_URL/RENDER_EXTERNAL_URL configured or image not under MEDIA_ROOT — using third-party hosts.")
+
+    if not public_url:
+        for host_name, upload_fn in (
+            ("catbox.moe", _upload_to_catbox),
+            ("tmpfiles.org", _upload_to_tmpfiles),
+        ):
+            try:
+                candidate_url = upload_fn(image_path)
+            except Exception as e:
+                upload_errors.append(f"{host_name} upload failed: {e}")
+                print(f"[GoogleLens] {host_name} upload failed: {e}")
+                continue
+            try:
+                _verify_public_image_url(candidate_url)
+                public_url = candidate_url
+                break
+            except Exception as e:
+                upload_errors.append(f"{host_name}: {e}")
+                print(f"[GoogleLens] {host_name} URL failed verification ({e}); trying next host if available...")
+                continue
 
     if not public_url:
         return _error(
