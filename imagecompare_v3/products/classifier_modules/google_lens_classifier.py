@@ -21,17 +21,48 @@ visual_matches[]:
         currency        str      e.g. "$"
     in_stock        bool
 
-NOTE: In this engine, visual_matches contains EVERYTHING including items
-with prices. There is NO separate shopping_results key in the main response.
-Prices live inside visual_matches as a nested price dict.
+exact_matches[]  (returned via engine=google_lens with type=exact_matches):
+    position          int
+    title             str
+    link              str
+    source            str
+    source_icon       str
+    thumbnail         str
+    date              str
+    actual_image_width  int
+    actual_image_height int
+    price             str      <- FLAT string, e.g. "$18*" (NOT a nested dict!)
+    extracted_price   float    <- flat float, e.g. 18.0
+    in_stock          bool
+    out_of_stock      bool
+
+NOTE (2026-07 SerpAPI change): "google_lens_exact_matches" is no longer a
+valid `engine` value. Exact matches are now requested via the SAME
+engine=google_lens call, using the `type` request parameter:
+    type=all             (default - can sometimes return an ai_overview
+                           block instead of matches for ambiguous images)
+    type=visual_matches   <- what we want for Call 1
+    type=exact_matches    <- what we want for Call 2
+    type=products
+    type=about_this_image
+Passing an old-style engine=google_lens_exact_matches now returns:
+    HTTP 400 {"error": "Unsupported `google_lens_exact_matches` search engine."}
+And omitting `type` (defaulting to "all") can return an `ai_overview` payload
+with NO `visual_matches` key at all for some images, which is why Call 1
+was silently coming back with 0 results. Explicitly passing
+type=visual_matches on Call 1 fixes this.
+
+Also note: exact_matches items use a FLAT `price` string + `extracted_price`
+float, while visual_matches items use a NESTED `price: {value,
+extracted_value, currency}` dict. _extract_price() below handles both.
 
 Flow:
   1. Upload image to tmpfiles.org -> public URL
-  2. Call SerpAPI google_lens -> visual_matches (with optional price/rating)
-  3. Call SerpAPI google_lens_exact_matches -> additional items
+  2. Call SerpAPI google_lens (type=visual_matches) -> visual_matches
+  3. Call SerpAPI google_lens (type=exact_matches) -> exact_matches
   4. Split into two lists:
-       shopping_results = visual_matches that HAVE a price
-       visual_matches   = visual_matches that have NO price
+       shopping_results = matches that HAVE a price
+       visual_matches   = matches that have NO price
   5. Return both lists with all fields properly extracted
 
 Timeout / retry policy (tuned from observed SerpAPI response times):
@@ -102,19 +133,129 @@ def _upload_to_tmpfiles(image_path: str) -> str:
     return direct_url
 
 
-def _call_serpapi(image_url: str, api_key: str, engine: str = "google_lens") -> dict:
+def _upload_to_catbox(image_path: str) -> str:
     """
-    GET SerpAPI with given engine.
+    Upload local image -> catbox.moe -> return direct file URL.
 
-    Retries up to MAX_RETRIES times on timeout (requests.exceptions.Timeout).
+    FALLBACK HOST — used only when tmpfiles.org fails to serve real image
+    content (see _verify_public_image_url). tmpfiles.org has been
+    intermittently returning an HTML page instead of the raw file on its
+    direct /dl/ link recently, which silently breaks Google Lens (it can't
+    read HTML as an image, so it just reports "no results").
+
+    catbox.moe's anonymous upload endpoint returns the direct file URL as
+    plain text in the response body — there's no separate "share page" vs
+    "direct link" distinction to get wrong, which is exactly the class of
+    bug tmpfiles.org just hit.
+    """
+    filename = Path(image_path).name
+    with open(image_path, "rb") as f:
+        resp = requests.post(
+            "https://catbox.moe/user/api.php",
+            data={"reqtype": "fileupload"},
+            files={"fileToUpload": (filename, f)},
+            timeout=TMPFILES_TIMEOUT,
+        )
+    if resp.status_code != 200:
+        raise Exception(f"catbox.moe HTTP {resp.status_code}: {resp.text[:200]}")
+    url = resp.text.strip()
+    if not url.startswith("http"):
+        raise Exception(f"catbox.moe unexpected response: {url[:200]}")
+    print(f"[GoogleLens] catbox.moe URL (fallback host): {url}")
+    return url
+
+
+_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def _verify_public_image_url(url: str) -> None:
+    """
+    Sanity-check that a freshly-uploaded public URL is actually reachable AND
+    served as real image content, before spending a SerpAPI call on it.
+
+    WHY THIS EXISTS: if the same image fails with SerpAPI's
+    "Google Lens hasn't returned any results for this query" /
+    images_results_state: "Fully empty" on every retry (not just
+    occasionally), the real cause is often NOT "Google found nothing" — it's
+    that the public host is serving something Google's crawler can't read as
+    an image at all: an HTML wrapper page instead of the raw file, a
+    non-image Content-Type, or an outright bot block. This check catches
+    that immediately with an unambiguous message instead of burning SerpAPI
+    calls against an unreadable URL.
+
+    NOTE: some hosts/CDNs (catbox.moe included) drop the connection outright
+    on HEAD requests, or on any request without a browser-like User-Agent,
+    rather than returning a normal HTTP error. So this always uses a single
+    small ranged GET with a browser User-Agent (never HEAD), and retries
+    once on a dropped connection before giving up — a dropped connection on
+    the first try doesn't necessarily mean the host is actually broken.
+    """
+    headers = {"User-Agent": _BROWSER_USER_AGENT, "Range": "bytes=0-2048"}
+    last_exc = None
+
+    for attempt in range(1, 3):
+        try:
+            resp = requests.get(url, timeout=15, stream=True, headers=headers)
+            content_type = resp.headers.get("Content-Type", "")
+            status = resp.status_code
+            resp.close()
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            print(f"[GoogleLens] URL verification attempt {attempt}/2 failed to connect: {e}")
+            if attempt < 2:
+                time.sleep(2)
+                continue
+            raise Exception(f"could not be reached ({e}).")
+
+        if status not in (200, 206):
+            raise Exception(f"returned HTTP {status} when verified directly.")
+        if not content_type.startswith("image/"):
+            raise Exception(
+                f"did not return image content (got Content-Type: '{content_type or 'none'}'). "
+                f"The host is likely serving an HTML page or blocking the request instead of "
+                f"the raw file — Google Lens can't read this as an image, which is why it "
+                f"silently reports no results."
+            )
+
+        print(f"[GoogleLens] Verified public URL serves real image content (Content-Type: {content_type})")
+        return
+
+
+def _call_serpapi(image_url: str, api_key: str, type_: str = "visual_matches") -> dict:
+    """
+    GET SerpAPI google_lens engine, requesting a specific result `type`.
+
+    IMPORTANT: SerpAPI removed the separate `google_lens_exact_matches`
+    engine. Both visual matches and exact matches now come from the SAME
+    engine ("google_lens"), distinguished by the `type` query parameter:
+        type=visual_matches -> populates response["visual_matches"]
+        type=exact_matches  -> populates response["exact_matches"]
+
+    Retries up to MAX_RETRIES times on:
+      - requests.exceptions.Timeout (network-level)
+      - a body-level "error" with HTTP 200 (SerpAPI/Google Lens sometimes
+        reports "hasn't returned any results for this query" /
+        images_results_state: "Fully empty" right after the image URL is
+        created — this is often a transient indexing-delay issue on
+        Google's side, not a real permanent failure, so it's worth a retry
+        before giving up).
+
     Raises immediately on 4xx/5xx HTTP errors — those are not transient.
     """
-    params = {"engine": engine, "url": image_url, "api_key": api_key}
+    params = {
+        "engine": "google_lens",
+        "url": image_url,
+        "api_key": api_key,
+        "type": type_,
+    }
     last_exc = None
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            print(f"[GoogleLens] {engine} attempt {attempt}/{MAX_RETRIES} (timeout={SERPAPI_TIMEOUT}s)")
+            print(f"[GoogleLens] type={type_} attempt {attempt}/{MAX_RETRIES} (timeout={SERPAPI_TIMEOUT}s)")
             resp = requests.get(SERPAPI_ENDPOINT, params=params, timeout=SERPAPI_TIMEOUT)
 
             if resp.status_code == 401:
@@ -124,13 +265,36 @@ def _call_serpapi(image_url: str, api_key: str, engine: str = "google_lens") -> 
             if resp.status_code != 200:
                 raise Exception(f"SerpAPI HTTP {resp.status_code}: {resp.text[:300]}")
 
-            return resp.json()
+            data = resp.json()
+
+            # SerpAPI can return HTTP 200 with a *body-level* "error" when
+            # Google Lens genuinely found nothing for the image at that
+            # moment (search_metadata.status is still "Success" — only the
+            # top-level "error" key + images_results_state: "Fully empty"
+            # give it away). This can be a transient indexing delay right
+            # after the tmpfiles.org URL was created, so retry before
+            # treating it as a real "no results" outcome.
+            if isinstance(data, dict) and data.get("error"):
+                state = (data.get("search_information") or {}).get("images_results_state", "")
+                msg = data["error"]
+                last_exc = Exception(msg)
+                print(
+                    f"[GoogleLens] SerpAPI returned a no-results error "
+                    f"(type={type_}, attempt {attempt}/{MAX_RETRIES}, state={state}): {msg}"
+                )
+                if attempt < MAX_RETRIES:
+                    print(f"[GoogleLens] Retrying in {RETRY_DELAY}s in case this was a transient indexing delay...")
+                    time.sleep(RETRY_DELAY)
+                    continue
+                raise last_exc
+
+            return data
 
         except requests.exceptions.Timeout as e:
             last_exc = e
             print(
                 f"[GoogleLens] Timeout on attempt {attempt}/{MAX_RETRIES} "
-                f"for engine={engine}. "
+                f"for type={type_}. "
                 + (f"Retrying in {RETRY_DELAY}s..." if attempt < MAX_RETRIES else "No more retries.")
             )
             if attempt < MAX_RETRIES:
@@ -143,46 +307,60 @@ def _call_serpapi(image_url: str, api_key: str, engine: str = "google_lens") -> 
                 time.sleep(RETRY_DELAY)
 
         except Exception:
-            # Non-transient (auth errors, rate limits, etc.) — raise immediately
+            # Non-transient (auth errors, rate limits, exhausted no-results
+            # retries, etc.) — raise immediately with the real message.
             raise
 
     # All retries exhausted — raise a clear, user-friendly message
     raise Exception(
-        f"SerpAPI did not respond within {SERPAPI_TIMEOUT}s after {MAX_RETRIES} attempts. "
-        f"The image search is taking unusually long. "
+        f"SerpAPI did not return usable results after {MAX_RETRIES} attempts. "
         f"Please try again in a moment. (last error: {last_exc})"
     )
 
 
 def _extract_price(item: dict) -> tuple:
     """
-    Extract price string and float from a visual_matches item.
+    Extract price string and float from a match item.
 
-    SerpAPI structure (confirmed):
+    Handles BOTH response shapes SerpAPI can return:
+
+    1) visual_matches shape — nested dict:
         item["price"] = {
             "value": "$18*",
             "extracted_value": 18.0,
             "currency": "$"
         }
 
+    2) exact_matches shape — flat fields:
+        item["price"] = "$18*"
+        item["extracted_price"] = 18.0
+
     Returns: (price_str, price_float)
         e.g. ("$18*", 18.0) or ("", 0.0)
     """
     price_obj = item.get("price")
-    if not price_obj or not isinstance(price_obj, dict):
-        return "", 0.0
-    price_str   = str(price_obj.get("value", "")).strip()
-    price_float = float(price_obj.get("extracted_value") or 0.0)
-    return price_str, price_float
+
+    # Shape 1: nested price dict (visual_matches)
+    if isinstance(price_obj, dict):
+        price_str   = str(price_obj.get("value", "")).strip()
+        price_float = float(price_obj.get("extracted_value") or 0.0)
+        return price_str, price_float
+
+    # Shape 2: flat price string + extracted_price (exact_matches)
+    if isinstance(price_obj, str) and price_obj.strip():
+        price_str   = price_obj.strip()
+        price_float = float(item.get("extracted_price") or 0.0)
+        return price_str, price_float
+
+    return "", 0.0
 
 
 def _parse_item(item: dict, rank: int) -> dict:
     """
-    Parse one SerpAPI visual_matches entry into a unified dict.
-
-    Captures ALL fields present in the live response:
+    Parse one SerpAPI match entry (visual_matches OR exact_matches) into a
+    unified dict. Captures all fields present across both shapes:
         position, title, link, source, thumbnail, image (full size),
-        rating, reviews, price (nested dict -> flat fields), in_stock
+        rating, reviews, price (flat or nested -> flat fields), in_stock
     """
     price_str, price_float = _extract_price(item)
 
@@ -193,7 +371,7 @@ def _parse_item(item: dict, rank: int) -> dict:
         "source"        : item.get("source", ""),
         "thumbnail"     : item.get("thumbnail", ""),
         "image_url"     : item.get("image", ""),       # full-size image from Google
-        # Price — from nested price dict
+        # Price — from nested dict (visual_matches) or flat fields (exact_matches)
         "price"         : price_str,
         "price_numeric" : price_float,
         "has_price"     : price_float > 0,
@@ -218,8 +396,8 @@ def classify(image_path: str) -> dict:
         base_keyword      str
         confidence        float
         knowledge_graph   dict
-        shopping_results  list  — items FROM visual_matches that HAVE a price
-        visual_matches    list  — items FROM visual_matches that have NO price
+        shopping_results  list  — items that HAVE a price
+        visual_matches    list  — items that have NO price
         public_image_url  str
         top5              list
         error             str
@@ -228,28 +406,61 @@ def classify(image_path: str) -> dict:
     if not api_key or api_key == "your_serpapi_key_here":
         return _error("SERPAPI_KEY not configured. Add to .env: SERPAPI_KEY=your_key")
 
-    # Step 1: Upload image to tmpfiles.org
-    try:
-        public_url = _upload_to_tmpfiles(image_path)
-    except Exception as e:
-        return _error(f"Image upload failed: {e}")
+    # Step 1: Upload image to a public host Google Lens can fetch, and
+    # verify it actually serves real image content. catbox.moe is now tried
+    # FIRST (tmpfiles.org has been intermittently returning an HTML page
+    # instead of the raw file on its direct /dl/ link, which silently
+    # breaks Google Lens). tmpfiles.org is kept as a fallback in case
+    # catbox.moe itself is ever unreachable, rather than removing it
+    # outright.
+    public_url = None
+    upload_errors = []
+    for host_name, upload_fn in (
+        ("catbox.moe", _upload_to_catbox),
+        ("tmpfiles.org", _upload_to_tmpfiles),
+    ):
+        try:
+            candidate_url = upload_fn(image_path)
+        except Exception as e:
+            upload_errors.append(f"{host_name} upload failed: {e}")
+            print(f"[GoogleLens] {host_name} upload failed: {e}")
+            continue
+        try:
+            _verify_public_image_url(candidate_url)
+            public_url = candidate_url
+            break
+        except Exception as e:
+            upload_errors.append(f"{host_name}: {e}")
+            print(f"[GoogleLens] {host_name} URL failed verification ({e}); trying next host if available...")
+            continue
 
-    # Step 2: Main Google Lens call (with retry)
+    if not public_url:
+        return _error(
+            "Could not get a working public image URL from any host. "
+            + " | ".join(upload_errors)
+        )
+
+    # Step 2: Main Google Lens call (with retry) — explicitly request the
+    # visual_matches tab so SerpAPI doesn't fall back to an ai_overview-only
+    # response for ambiguous images.
     try:
-        print("[GoogleLens] Call 1: google_lens engine")
-        data1 = _call_serpapi(public_url, api_key, "google_lens")
+        print("[GoogleLens] Call 1: engine=google_lens type=visual_matches")
+        data1 = _call_serpapi(public_url, api_key, type_="visual_matches")
         raw1  = data1.get("visual_matches", [])
         print(f"[GoogleLens] Call 1 OK: {len(raw1)} visual_matches")
     except Exception as e:
         return _error(str(e))
 
     # Step 3: Exact matches call (additional items, best-effort — one attempt only)
+    # SerpAPI no longer has a separate "google_lens_exact_matches" engine —
+    # exact matches come from engine=google_lens with type=exact_matches,
+    # and the results live under the "exact_matches" key (not "visual_matches").
     data2 = {}
     raw2  = []
     try:
-        print("[GoogleLens] Call 2: google_lens_exact_matches engine")
-        data2 = _call_serpapi(public_url, api_key, "google_lens_exact_matches")
-        raw2  = data2.get("visual_matches", []) + data2.get("shopping_results", [])
+        print("[GoogleLens] Call 2: engine=google_lens type=exact_matches")
+        data2 = _call_serpapi(public_url, api_key, type_="exact_matches")
+        raw2  = data2.get("exact_matches", [])
         print(f"[GoogleLens] Call 2 OK: {len(raw2)} items")
     except Exception as e:
         # Non-fatal — we already have Call 1 results
