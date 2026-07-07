@@ -133,6 +133,19 @@ def _upload_to_tmpfiles(image_path: str) -> str:
     return direct_url
 
 
+def _is_on_render() -> bool:
+    """
+    Detect whether this process is running on Render.
+
+    Render automatically sets RENDER=true in every environment (build and
+    runtime) for every service, and nothing else sets this — it's the
+    cleanest possible signal to distinguish "deployed on Render, our own
+    domain is genuinely public" from "running locally on a dev machine,
+    localhost is NOT reachable by Google's crawler at all".
+    """
+    return os.environ.get("RENDER", "").lower() == "true"
+
+
 def _get_own_site_public_url(image_path: str) -> str:
     """
     Build a public URL for the ALREADY-UPLOADED image using this app's own
@@ -462,44 +475,45 @@ def classify(image_path: str) -> dict:
     if not api_key or api_key == "your_serpapi_key_here":
         return _error("SERPAPI_KEY not configured. Add to .env: SERPAPI_KEY=your_key")
 
-    # Step 1: Upload image to a public host Google Lens can fetch, and
-    # verify it actually serves real image content.
+    # Step 1: Get a public image URL Google Lens can fetch.
     #
-    # We try our OWN site's public media URL FIRST (via RENDER_EXTERNAL_URL
-    # or PUBLIC_SITE_URL) — since the app is already publicly hosted, this
-    # sidesteps catbox.moe/tmpfiles.org entirely, along with their
-    # anti-abuse blocks on cloud/datacenter IPs (Render included), which is
-    # what "catbox.moe HTTP 412: Invalid uploader" and tmpfiles.org's
-    # HTML-instead-of-file responses are. Only if that's unavailable or
-    # unreachable do we fall back to catbox.moe, then tmpfiles.org.
+    # - ON RENDER: use our own site's live media URL directly
+    #   (https://<app>.onrender.com/media/uploads/<file>). The app is
+    #   genuinely publicly reachable there, so no third-party host is
+    #   needed, and it sidesteps catbox.moe/tmpfiles.org anti-abuse blocks
+    #   on cloud/datacenter IPs entirely (what caused the earlier
+    #   "catbox.moe HTTP 412: Invalid uploader" / tmpfiles.org HTML
+    #   responses). We do NOT self-verify this URL with a network call
+    #   back to our own server — on Render's default single-gunicorn-worker
+    #   setup (WEB_CONCURRENCY=1) that would deadlock, since the current
+    #   request handler IS the only worker available to answer it. We
+    #   already know the file exists locally (we just saved it), and only
+    #   SerpAPI's external crawler can actually test public reachability
+    #   anyway.
+    #
+    # - LOCALLY (not on Render): our own dev server isn't publicly
+    #   reachable at all (localhost/127.0.0.1 mean nothing to Google's
+    #   crawler), so skip straight to catbox.moe, falling back to
+    #   tmpfiles.org if that fails — same as before.
     public_url = None
     upload_errors = []
 
-    own_url = _get_own_site_public_url(image_path)
-    if own_url:
-        # IMPORTANT: do NOT verify this URL with a network call back to our
-        # own server (as we do for catbox.moe/tmpfiles.org below). On a
-        # single-gunicorn-worker deployment (WEB_CONCURRENCY=1, which Render
-        # sets by default on small instances), the current request handler
-        # IS that one worker — a synchronous self-request has no free
-        # worker to answer it and will always time out, deadlocking every
-        # single time, regardless of whether the URL actually works.
-        #
-        # We don't need to self-verify anyway: we just saved this file
-        # ourselves in this same request, so we already know it exists.
-        # What matters is whether SerpAPI's crawler (an entirely separate,
-        # external process) can reach it — and that's something only an
-        # external fetch can actually test. If it can't, SerpAPI's
-        # "Fully empty" / no-results response (already handled above with
-        # retries) will tell us so, with no deadlock risk.
-        if os.path.exists(image_path):
+    if _is_on_render():
+        own_url = _get_own_site_public_url(image_path)
+        if own_url and os.path.exists(image_path):
             public_url = own_url
-            print(f"[GoogleLens] Using own site's public media URL (skipping self-verification to avoid single-worker deadlock): {own_url}")
-        else:
+            print(f"[GoogleLens] Running on Render — using own site's public media URL: {own_url}")
+        elif own_url:
             upload_errors.append(f"own site URL ({own_url}): local file not found at {image_path}")
-            print(f"[GoogleLens] Own site URL skipped — local file not found at {image_path}")
+            print(f"[GoogleLens] Running on Render but local file not found at {image_path}")
+        else:
+            upload_errors.append(
+                "Running on Render but could not build own-site media URL "
+                "(check MEDIA_ROOT/MEDIA_URL settings, or set PUBLIC_SITE_URL explicitly)"
+            )
+            print("[GoogleLens] Running on Render but could not build own-site media URL — falling back to third-party hosts.")
     else:
-        print("[GoogleLens] No PUBLIC_SITE_URL/RENDER_EXTERNAL_URL configured or image not under MEDIA_ROOT — using third-party hosts.")
+        print("[GoogleLens] Not running on Render (local dev) — localhost isn't publicly reachable, using catbox.moe/tmpfiles.org.")
 
     if not public_url:
         for host_name, upload_fn in (
