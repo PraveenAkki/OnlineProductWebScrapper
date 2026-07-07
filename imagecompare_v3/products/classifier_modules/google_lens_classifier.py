@@ -135,12 +135,14 @@ def _upload_to_cloudinary(image_path: str) -> str:
         )
 
     timestamp = str(int(time.time()))
-    params_str = f"timestamp={timestamp}"
-    signature = hmac.new(
-        api_secret.encode("utf-8"),
-        params_str.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
+    # Cloudinary's signing rule: sort signed params alphabetically, join as
+    # key=value&key=value, then APPEND the api_secret directly (no HMAC key)
+    # and hash the whole string with SHA-1 (Cloudinary's default algorithm).
+    # The previous HMAC-SHA256 approach is a different algorithm entirely and
+    # will always be rejected with "Invalid Signature".
+    params_to_sign = f"timestamp={timestamp}"
+    string_to_sign = params_to_sign + api_secret
+    signature = hashlib.sha1(string_to_sign.encode("utf-8")).hexdigest()
 
     filename = Path(image_path).name
     url = CLOUDINARY_UPLOAD.format(cloud_name=cloud_name)
