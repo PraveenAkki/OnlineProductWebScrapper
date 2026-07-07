@@ -1,6 +1,7 @@
 from django.db import models
 
 
+
 class SearchHistory(models.Model):
     image              = models.ImageField(upload_to='uploads/')
 
@@ -67,9 +68,9 @@ class GoogleLensResult(models.Model):
     result_type   = models.CharField(max_length=10, choices=RESULT_TYPES, default="visual")
     rank          = models.PositiveSmallIntegerField(default=0)   # Google's rank (1-based)
     title         = models.CharField(max_length=500, blank=True)
-    link          = models.URLField(max_length=2000)              # page to scrape
+    link          = models.URLField(max_length=3000)              # page to scrape
     source        = models.CharField(max_length=200, blank=True)  # site name e.g. "Amazon.in"
-    thumbnail     = models.URLField(max_length=2000, blank=True)  # product image from Google
+    thumbnail     = models.URLField(max_length=3000, blank=True)  # product image from Google
 
     # ── Shopping-only fields (populated from SerpAPI shopping_results) ──────
     price         = models.CharField(max_length=50,  blank=True)  # display e.g. "₹499"
@@ -80,7 +81,7 @@ class GoogleLensResult(models.Model):
     tag           = models.CharField(max_length=100, blank=True)  # e.g. "Best seller"
 
     # ── Visual-only fields ───────────────────────────────────────
-    image_url     = models.URLField(max_length=2000, blank=True)  # original image URL
+    image_url     = models.URLField(max_length=3000, blank=True)  # original image URL
 
     # ── Scraper control ──────────────────────────────────────────
     scraped       = models.BooleanField(default=False)
@@ -128,11 +129,13 @@ class Product(models.Model):
     discount      = models.CharField(max_length=50,  blank=True)
     rating        = models.CharField(max_length=20,  blank=True)
     reviews       = models.CharField(max_length=30,  blank=True)
-    product_image = models.URLField(max_length=1000, blank=True)
-    product_link  = models.URLField(max_length=1000)
+    product_image = models.URLField(max_length=3000, blank=True)
+    product_link  = models.URLField(max_length=3000)
     delivery      = models.CharField(max_length=100, blank=True)
-
+    last_scraped_at = models.DateTimeField(null=True, blank=True)
     created_at    = models.DateTimeField(auto_now_add=True, null=True, blank=True)
 
     def __str__(self):
         return f"[{self.website}] {self.product_name[:60]} | {self.price}"
+
+

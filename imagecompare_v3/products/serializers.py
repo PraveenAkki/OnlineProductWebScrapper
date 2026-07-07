@@ -8,11 +8,22 @@ class ProductSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'website', 'product_name', 'price', 'price_numeric',
             'discount', 'rating', 'reviews', 'product_image',
-            'product_link', 'delivery', 'created_at',
+            'product_link', 'delivery', 'created_at', 'last_scraped_at', 
         ]
 
 
 class GoogleLensResultSerializer(serializers.ModelSerializer):
+    product_id = serializers.SerializerMethodField()   # ← THIS WAS MISSING
+
+    def get_product_id(self, obj):
+        """
+        Returns the id of the Product row promoted from this lens result,
+        or None if it hasn't been promoted yet. Lets the UI show
+        '✓ In products' vs 'Not promoted' without a separate lookup.
+        """
+        product = getattr(obj, "product", None)
+        return product.id if product else None
+
     class Meta:
         model  = GoogleLensResult
         fields = [
@@ -20,7 +31,7 @@ class GoogleLensResultSerializer(serializers.ModelSerializer):
             'title', 'link', 'source', 'thumbnail', 'image_url',
             'price', 'price_numeric', 'rating', 'reviews',
             'delivery', 'tag',
-            'scraped', 'scraped_price', 'scraped_rating', 'scraped_at',
+            'scraped', 'scraped_price', 'scraped_rating', 'scraped_at', 'product_id',
             'created_at',
         ]
 

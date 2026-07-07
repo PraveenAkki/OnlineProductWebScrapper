@@ -1,7 +1,7 @@
 import re
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework import status
+from rest_framework import request, status
 from django.conf import settings
 
 from .models import SearchHistory, GoogleLensResult
@@ -66,10 +66,10 @@ def _build_shopping_row(search, item: dict) -> GoogleLensResult:
         result_type   = "shopping",
         rank          = int(item.get("rank") or 0),
         title         = str(item.get("title") or "")[:500],
-        link          = str(item.get("link") or "")[:2000],
-        source        = str(item.get("source") or "")[:200],
-        thumbnail     = str(item.get("thumbnail") or "")[:2000],
-        image_url     = str(item.get("image_url") or "")[:2000],
+        source        = str(item.get("source") or "")[:200],    
+        link          = _safe_link(item, "link"),
+        thumbnail     = _safe_link(item, "thumbnail"),
+        image_url     = _safe_link(item, "image_url"),
         # Price — already extracted by classifier from nested price dict
         price         = str(item.get("price") or "")[:50],
         price_numeric = float(item.get("price_numeric") or 0.0),
@@ -91,10 +91,10 @@ def _build_visual_row(search, item: dict) -> GoogleLensResult:
         result_type   = "visual",
         rank          = int(item.get("rank") or 0),
         title         = str(item.get("title") or "")[:500],
-        link          = str(item.get("link") or "")[:2000],
         source        = str(item.get("source") or "")[:200],
-        thumbnail     = str(item.get("thumbnail") or "")[:2000],
-        image_url     = str(item.get("image_url") or "")[:2000],
+        link          = _safe_link(item, "link"),
+        thumbnail     = _safe_link(item, "thumbnail"),
+        image_url     = _safe_link(item, "image_url"),
         price         = "",
         price_numeric = 0.0,
         # Visual matches CAN have rating/reviews in this engine
@@ -371,14 +371,36 @@ class GoogleLensResultsView(APIView):
         elif order_param == "price_desc":
             qs = qs.order_by("result_type", "-price_numeric", "rank")
 
-        results = list(qs.values(
-            "id", "result_type", "rank",
-            "title", "link", "source", "thumbnail", "image_url",
-            "price", "price_numeric", "rating", "reviews",
-            "delivery", "tag",
-            "scraped", "scraped_price", "scraped_rating", "scraped_at",
-            "created_at",
-        ))
+        # ── select_related("product") pulls the linked Product (if any) in
+        # the same query via JOIN, so we can tell the frontend whether this
+        # lens result has already been promoted — without an N+1 query.
+        qs = qs.select_related("product")
+
+        results = []
+        for lr in qs:
+            product = getattr(lr, "product", None)
+            results.append({
+                "id"             : lr.id,
+                "result_type"    : lr.result_type,
+                "rank"           : lr.rank,
+                "title"          : lr.title,
+                "link"           : lr.link,
+                "source"         : lr.source,
+                "thumbnail"      : lr.thumbnail,
+                "image_url"      : lr.image_url,
+                "price"          : lr.price,
+                "price_numeric"  : lr.price_numeric,
+                "rating"         : lr.rating,
+                "reviews"        : lr.reviews,
+                "delivery"       : lr.delivery,
+                "tag"            : lr.tag,
+                "scraped"        : lr.scraped,
+                "scraped_price"  : lr.scraped_price,
+                "scraped_rating" : lr.scraped_rating,
+                "scraped_at"     : lr.scraped_at,
+                "created_at"     : lr.created_at,
+                "product_id"     : product.id if product else None,
+            })
 
         shopping_count = sum(1 for r in results if r["result_type"] == "shopping")
         visual_count   = sum(1 for r in results if r["result_type"] == "visual")
@@ -444,3 +466,13 @@ class PhaseInfoView(APIView):
                 "GET  /api/searches/<id>/lens-results/?order=price_desc" : "Sort by price high to low",
             },
         })
+    
+
+
+def _safe_link(item: dict, key: str, max_len: int = 3000) -> str:
+    raw = str(item.get(key) or "")
+    print(f"[View] _safe_link key={key} len={len(raw)} max_len={max_len} url={raw[:120]}")
+    if len(raw) > max_len:
+        print(f"[View] WARNING: {key} truncated from {len(raw)} to {max_len} chars: {raw[:80]}...")
+        raw = raw[:max_len]
+    return raw

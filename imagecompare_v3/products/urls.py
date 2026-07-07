@@ -12,9 +12,11 @@ from .views_scrape import (
     PromoteShoppingResultsView,
     ScrapeSearchView,
     ScrapeSearchAllView,
-    RetryFailedScrapeView,       # ← NEW: retry bot-blocked rows
+    RetryFailedScrapeView,
     ScrapeSingleResultView,
     SearchProductsView,
+    RescrapeProductView,
+    RescrapeAllProductsView,
 )
 from .export_views import (
     ExportSearchView,
@@ -52,4 +54,8 @@ urlpatterns = [
 
     # ── Info ──────────────────────────────────────────────────────
     path('phase/',               PhaseInfoView.as_view(),              name='phase-info'),
+
+    # ── Rescrape ──────────────────────────────────────────────────
+    path('products/<int:pk>/rescrape/',           RescrapeProductView.as_view(),      name='rescrape-product'),
+    path('searches/<int:pk>/rescrape-products/',  RescrapeAllProductsView.as_view(),  name='rescrape-all-products'),
 ]

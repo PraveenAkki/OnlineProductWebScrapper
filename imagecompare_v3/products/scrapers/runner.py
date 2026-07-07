@@ -15,8 +15,10 @@ THREE BUGS FIXED:
      removed from the retry queue. Now scraped stays False on retryable errors.
 """
 
-from django.utils import timezone
+from unittest import result
 
+from django.utils import timezone
+from unittest import result
 # ── FIX 1: ADD THESE IMPORTS (were completely missing before) ─────────────────
 from .filters import (
     is_allowed_site,          # blocks social media / non-shopping sites
@@ -24,6 +26,19 @@ from .filters import (
     normalize_price_to_inr,   # converts $ € £ → ₹ before saving to DB
 )
 
+
+# Defense-in-depth: even if a scraper's own block-detection misses it,
+# never accept these as a legitimate product_name. Catches cases like
+# a generic "h1" selector matching an Access Denied page's heading.
+BLOCKED_NAME_MARKERS = (
+    "access denied", "captcha", "unusual traffic",
+    "are you a human", "request blocked", "pardon our interruption",
+)
+
+
+def _looks_like_block_page(name: str) -> bool:
+    n = (name or "").strip().lower()
+    return any(marker in n for marker in BLOCKED_NAME_MARKERS)
 
 def _detect_website(url: str) -> str:
     try:
@@ -200,12 +215,20 @@ def scrape_one(lens_result_id: int) -> dict:
 
     # HTTP scrape
     website = _detect_website(url)
-    scraper = get_scraper(url)
+    scraper, resolved_url = get_scraper(url)
     print(f"[Runner] Scraping [{website}] {url[:80]}...")
-    data = scraper.scrape(url)
+    data = scraper.scrape(resolved_url)
 
     error_msg = data.get("error", "")
-    is_success = bool(data.get("product_name")) and not error_msg
+    scraped_name_check = data.get("product_name", "")
+    is_success = (
+        bool(scraped_name_check)
+        and not error_msg
+        and not _looks_like_block_page(scraped_name_check)
+    )
+    if bool(scraped_name_check) and _looks_like_block_page(scraped_name_check):
+        error_msg = f"Rejected likely block-page content: '{scraped_name_check[:60]}'"
+        print(f"[Runner] {error_msg}")
     # retryable=True means bot-block/timeout → keep scraped=False for retry
     retryable = data.get("retryable", True)
 
@@ -240,7 +263,18 @@ def scrape_one(lens_result_id: int) -> dict:
     lr.scraped_at     = timezone.now()
     lr.scraped_price  = inr_display
     lr.scraped_rating = data.get("rating", "")
-    lr.save(update_fields=["scraped", "scraped_price", "scraped_rating", "scraped_at"])
+
+    update_fields = ["scraped", "scraped_price", "scraped_rating", "scraped_at"]
+
+    # A visual match that now has a confirmed price is effectively a
+    # priced/shopping result — flip result_type so it shows under the
+    # "Shopping" filter tab instead of staying labeled "visual" forever.
+    if lr.result_type == "visual" and inr_numeric > 0:
+        lr.result_type = "shopping"
+        update_fields.append("result_type")
+        print(f"[Runner] lens_result {lr.id} promoted visual → shopping (price confirmed)")
+
+    lr.save(update_fields=update_fields)
 
     product, created = Product.objects.update_or_create(
         lens_result = lr,
@@ -368,3 +402,283 @@ def retry_failed(search_id: int, limit: int = 20) -> dict:
     Frontend received '<html...' → "Unexpected token '<'" error.
     """
     return scrape_batch(search_id, limit=limit)
+
+
+
+def rescrape_one(product_id: int) -> dict:
+    """
+    Refresh price for an existing Product row.
+
+    If the Product is linked to a GoogleLensResult, delegate to
+    rescrape_lens_result() so Products-page and Lens-Results-page rescrapes
+    share the exact same filter/promotion/result_type logic and stay in sync.
+
+    Falls back to a direct URL re-scrape only for products with no
+    lens_result link (e.g. legacy rows or manually-created products) —
+    those have no GoogleLensResult to flip visual→shopping on, since the
+    result_type field lives on GoogleLensResult, not Product.
+    """
+    from products.models import Product
+    from .router import get_scraper
+
+    try:
+        product = Product.objects.select_related("lens_result").get(pk=product_id)
+    except Product.DoesNotExist:
+        return {"success": False, "product_id": None,
+                "error": f"Product {product_id} not found", "retryable": False}
+
+    # ── Preferred path: delegate through the linked lens_result ────────────
+    # This keeps GoogleLensResult.scraped/scraped_price/result_type and the
+    # Product row perfectly in sync, using one shared code path.
+    if product.lens_result_id:
+        result = rescrape_lens_result(product.lens_result_id)
+        if result.get("success"):
+            product.refresh_from_db()
+            product.last_scraped_at = timezone.now()
+            product.save(update_fields=["last_scraped_at"])
+            result["product_id"] = product.id
+        return result
+
+    # ── Fallback: no linked lens_result — scrape the URL directly ──────────
+    url = product.product_link
+    if not url:
+        return {"success": False, "product_id": product_id,
+                "error": "No URL to rescrape", "retryable": False}
+
+    if not is_allowed_site(url):
+        return {"success": False, "product_id": product_id,
+                "error": f"Site blocked: {product.website}", "retryable": False}
+
+    if not is_imitation_jewellery(product.product_name or ""):
+        return {"success": False, "product_id": product_id,
+                "error": "Real gold listing — skipped", "retryable": False}
+
+    website = _detect_website(url)
+    scraper, resolved_url = get_scraper(url)
+    print(f"[Runner] Rescraping [{website}] {url[:80]}...")
+    data = scraper.scrape(resolved_url)
+
+    error_msg  = data.get("error", "")
+    is_success = (
+        bool(data.get("product_name"))
+        and not error_msg
+        and not _looks_like_block_page(data.get("product_name", ""))
+    )
+    retryable  = data.get("retryable", True)
+
+    if not is_success:
+        print(f"[Runner] RESCRAPE FAIL [{website}]: {error_msg}")
+        return {"success": False, "product_id": product_id,
+                "error": error_msg, "retryable": retryable}
+
+    scraped_name = data.get("product_name", "")
+    if not is_imitation_jewellery(scraped_name):
+        return {"success": False, "product_id": product_id,
+                "error": "Real gold after rescrape — skipped", "retryable": False}
+
+    inr_display, inr_numeric = normalize_price_to_inr(
+        data.get("price", ""), data.get("price_numeric", 0.0)
+    )
+
+    old_price = product.price
+    product.product_name    = scraped_name
+    product.price           = inr_display
+    product.price_numeric   = inr_numeric
+    product.discount        = data.get("discount", product.discount)
+    product.rating          = data.get("rating", product.rating)
+    product.reviews         = data.get("reviews", product.reviews)
+    product.product_image   = data.get("product_image", product.product_image)
+    product.delivery        = data.get("delivery", product.delivery)
+    product.last_scraped_at = timezone.now()
+    product.save(update_fields=[
+        "product_name", "price", "price_numeric", "discount", "rating",
+        "reviews", "product_image", "delivery", "last_scraped_at",
+    ])
+
+    print(f"[Runner] ✓ Rescraped Product id={product.id} [{website}] "
+          f"{old_price} → {inr_display}")
+    return {
+        "success"      : True,
+        "product_id"   : product.id,
+        "error"        : "",
+        "retryable"    : False,
+        "old_price"    : old_price,
+        "price"        : inr_display,
+        "price_numeric": inr_numeric,
+        "name"         : scraped_name,
+        "rating"       : product.rating,
+        "website"      : website,
+        "promoted"     : True,
+    }
+
+    
+
+# ── NEW: rescrape every product in a search ────────────────────────────────
+def rescrape_all_products(search_id: int) -> dict:
+    """
+    Loop every Product row belonging to a search and refresh its price
+    via rescrape_one(). Returns aggregate success/failure counts.
+    """
+    from products.models import Product
+
+    products = Product.objects.filter(search_id=search_id)
+    total = products.count()
+    success = failed = 0
+    results = []
+
+    for p in products:
+        out = rescrape_one(p.id)
+        results.append({
+            "product_id": p.id,
+            "website"   : p.website,
+            **out,
+        })
+        if out.get("success"):
+            success += 1
+        else:
+            failed += 1
+
+    print(f"[Runner] rescrape_all_products done: total={total} "
+          f"success={success} failed={failed}")
+    return {
+        "search_id": search_id,
+        "total"    : total,
+        "success"  : success,
+        "failed"   : failed,
+        "results"  : results,
+    }
+
+
+def rescrape_lens_result(lens_result_id: int) -> dict:
+    """
+    Force a fresh scrape of a GoogleLensResult.
+    On failure, the existing Product (if any) is left completely untouched,
+    AND the lens_result's scraped/promoted state is restored to what it was
+    before the attempt — so a failed price-refresh never makes a
+    previously-successful item look unscraped or unpromoted.
+    """
+    from products.models import GoogleLensResult
+
+    try:
+        lr = GoogleLensResult.objects.get(pk=lens_result_id)
+    except GoogleLensResult.DoesNotExist:
+        return {"success": False, "product_id": None,
+                "error": f"GoogleLensResult {lens_result_id} not found", "retryable": False}
+
+    from products.models import Product
+    existing_product = Product.objects.filter(lens_result_id=lens_result_id).first()
+
+    prior_scraped        = lr.scraped
+    prior_scraped_price   = lr.scraped_price
+    prior_scraped_rating  = lr.scraped_rating
+    prior_scraped_at      = lr.scraped_at
+    prior_result_type     = lr.result_type
+
+    if lr.scraped:
+        lr.scraped = False
+        lr.save(update_fields=["scraped"])
+
+    result = scrape_one(lens_result_id)
+    result["lens_result_id"] = lens_result_id
+    result["promoted"] = bool(result.get("success") and result.get("product_id"))
+
+    if not result.get("success") and existing_product:
+        lr.refresh_from_db()
+        lr.scraped        = prior_scraped
+        lr.scraped_price  = prior_scraped_price
+        lr.scraped_rating = prior_scraped_rating
+        lr.scraped_at     = prior_scraped_at
+        lr.result_type     = prior_result_type
+        lr.save(update_fields=["scraped", "scraped_price", "scraped_rating", "scraped_at", "result_type"])
+        result["promoted"]      = True
+        result["product_id"]    = existing_product.id
+        result["kept_old_data"] = True
+        print(f"[Runner] Rescrape failed for lr={lens_result_id}, kept existing Product "
+              f"id={existing_product.id} unchanged")
+
+    return result
+
+# ── REPLACES old rescrape_one: now delegates through lens_result when possible
+def rescrape_one(product_id: int) -> dict:
+    """
+    Refresh price for an existing Product row.
+    If the Product is linked to a GoogleLensResult, delegate to
+    rescrape_lens_result() so Products-page and Lens-Results-page rescrapes
+    share the exact same filter/promotion logic and stay in sync.
+    Falls back to a direct URL re-scrape for products with no lens_result
+    link (e.g. legacy rows or manually-created products).
+    """
+    from products.models import Product
+    from .router import get_scraper
+
+    try:
+        product = Product.objects.select_related("lens_result").get(pk=product_id)
+    except Product.DoesNotExist:
+        return {"success": False, "product_id": None,
+                "error": f"Product {product_id} not found", "retryable": False}
+
+    if product.lens_result_id:
+        result = rescrape_lens_result(product.lens_result_id)
+        if result.get("success"):
+            product.refresh_from_db()
+            product.last_scraped_at = timezone.now()
+            product.save(update_fields=["last_scraped_at"])
+            result["product_id"] = product.id
+        return result
+
+    # ── Fallback: no linked lens_result — scrape the URL directly ──────────
+    url = product.product_link
+    if not url:
+        return {"success": False, "product_id": product_id,
+                "error": "No URL to rescrape", "retryable": False}
+
+    if not is_allowed_site(url):
+        return {"success": False, "product_id": product_id,
+                "error": f"Site blocked: {product.website}", "retryable": False}
+
+    if not is_imitation_jewellery(product.product_name or ""):
+        return {"success": False, "product_id": product_id,
+                "error": "Real gold listing — skipped", "retryable": False}
+
+    website = _detect_website(url)
+    scraper, resolved_url = get_scraper(url)
+    data = scraper.scrape(resolved_url)
+
+    error_msg  = data.get("error", "")
+    is_success = bool(data.get("product_name")) and not error_msg
+    retryable  = data.get("retryable", True)
+
+    if not is_success:
+        return {"success": False, "product_id": product_id,
+                "error": error_msg, "retryable": retryable}
+
+    scraped_name = data.get("product_name", "")
+    if not is_imitation_jewellery(scraped_name):
+        return {"success": False, "product_id": product_id,
+                "error": "Real gold after rescrape — skipped", "retryable": False}
+
+    inr_display, inr_numeric = normalize_price_to_inr(
+        data.get("price", ""), data.get("price_numeric", 0.0)
+    )
+
+    old_price = product.price
+    product.product_name    = scraped_name
+    product.price           = inr_display
+    product.price_numeric   = inr_numeric
+    product.discount        = data.get("discount", product.discount)
+    product.rating          = data.get("rating", product.rating)
+    product.reviews         = data.get("reviews", product.reviews)
+    product.product_image   = data.get("product_image", product.product_image)
+    product.delivery        = data.get("delivery", product.delivery)
+    product.last_scraped_at = timezone.now()
+    product.save(update_fields=[
+        "product_name", "price", "price_numeric", "discount", "rating",
+        "reviews", "product_image", "delivery", "last_scraped_at",
+    ])
+
+    return {
+        "success": True, "product_id": product.id, "error": "", "retryable": False,
+        "old_price": old_price, "price": inr_display, "price_numeric": inr_numeric,
+        "name": scraped_name, "rating": product.rating, "website": website,
+        "promoted": True,
+    }

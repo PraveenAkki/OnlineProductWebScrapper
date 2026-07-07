@@ -435,6 +435,7 @@
           <input type="number" class="filter-input" id="filter-min" placeholder="Min ₹" style="width:90px" oninput="applyFilters()">
           <input type="number" class="filter-input" id="filter-max" placeholder="Max ₹" style="width:90px" oninput="applyFilters()">
           <button class="btn btn-sm btn-ghost" onclick="clearFilters()">Clear</button>
+          <button class="btn btn-sm btn-primary" onclick="rescrapeAllProducts()">🔄 Refresh all prices</button>
         </div>
       </div>
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
@@ -503,6 +504,9 @@
           <button class="toggle-item" onclick="setLensFilter('visual',this)">Visual</button>
           <button class="toggle-item" onclick="setLensFilter('unscraped',this)">Not scraped</button>
         </div>
+        <select class="filter-select" id="lens-filter-website" onchange="applyLensWebsiteFilter()">
+          <option value="">All websites</option>
+        </select>
       </div>
       <div id="lens-grid" class="product-grid"></div>
       <div id="lens-loading" class="loading-state" style="display:none"><div class="spinner"></div></div>
@@ -619,6 +623,7 @@ let allLensResults = [];
 let viewMode = 'grid';
 let activeFilters = { type: 'all', website: '', sort: 'price_asc', min: '', max: '' };
 let lensFilter = 'all';
+let lensWebsiteFilter = '';
 
 // ── Nav ──────────────────────────────────────────────────────────
 function showPage(id, navEl) {
@@ -801,7 +806,7 @@ function renderProducts(prods) {
   if(activeFilters.min) f=f.filter(p=>p.price_numeric>=parseFloat(activeFilters.min));
   if(activeFilters.max) f=f.filter(p=>p.price_numeric<=parseFloat(activeFilters.max));
   const gs=document.getElementById('global-search').value.toLowerCase();
-  if(gs) f=f.filter(p=>(p.title||'').toLowerCase().includes(gs)||(p.website||'').toLowerCase().includes(gs));
+  if(gs) f=f.filter(p=>(p.product_name||'').toLowerCase().includes(gs)||(p.website||'').toLowerCase().includes(gs));
   if(activeFilters.sort==='rating') f.sort((a,b)=>parseFloat(b.rating||0)-parseFloat(a.rating||0));
   document.getElementById('product-count-label').textContent=`${f.length} product${f.length!==1?'s':''}`;
   if(!f.length){document.getElementById('products-empty').style.display='block';document.getElementById('product-grid-view').innerHTML='';return;}
@@ -817,7 +822,7 @@ function renderProducts(prods) {
       <div class="product-img-placeholder" style="${th?'display:none':''}">🛍</div></div>
       <div class="product-body">
         <div class="product-source">${site}</div>
-        <div class="product-name" title="${p.title||''}">${p.title||'Untitled'}</div>
+        <div class="product-name" title="${p.product_name||''}">${p.product_name||'Untitled'}</div>
         <div class="product-meta"><span class="product-price ${iL?'lowest':iH?'highest':''}">${fmtPrice(p.price||p.price_numeric)}</span></div>
         ${p.rating?`<div class="product-rating"><span class="stars">${fmtStars(p.rating)}</span> ${p.rating}${p.reviews?' ('+p.reviews+')':''}</div>`:''}
         <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px">
@@ -825,7 +830,10 @@ function renderProducts(prods) {
           ${iL?'<span class="badge badge-green">Lowest</span>':''}${iH?'<span class="badge badge-red">Highest</span>':''}
         </div>
       </div>
-      <div class="product-footer"><a href="${p.product_link||'#'}" target="_blank" rel="noopener" class="btn btn-sm" style="width:100%;justify-content:center">Open product ↗</a></div>
+      <div class="product-footer" style="display:flex;gap:6px">
+        <a href="${p.product_link||'#'}" target="_blank" rel="noopener" class="btn btn-sm" style="flex:1;justify-content:center">Open Product↗</a>
+        <button class="btn btn-sm" title="${p.last_scraped_at?'Last checked: '+new Date(p.last_scraped_at).toLocaleString():'Refresh price'}" onclick="rescrapeProduct(${p.id}, this)">🔄</button>
+      </div>
     </div>`;
   }).join('');
   document.getElementById('product-table-body').innerHTML=f.map(p=>{
@@ -834,12 +842,15 @@ function renderProducts(prods) {
     return `<tr class="${iL?'highlight-green':iH?'highlight-red':''}">
       <td style="max-width:240px"><div style="display:flex;align-items:center;gap:8px">
         ${th?`<img src="${th}" style="width:36px;height:36px;object-fit:cover;border-radius:6px;border:1px solid var(--border)" onerror="this.style.display='none'">`:`<div style="width:36px;height:36px;background:var(--bg);border-radius:6px;display:flex;align-items:center;justify-content:center">🛍</div>`}
-        <span style="font-size:13px">${p.title||'—'}</span></div></td>
+        <span style="font-size:13px">${p.product_name||'—'}</span></div></td>
       <td>${p.website||getDomain(p.product_link||'')||'—'}</td>
       <td style="font-weight:${iL||iH?'600':'400'}">${fmtPrice(p.price||p.price_numeric)}</td>
       <td>${p.rating?`<span class="stars">${fmtStars(p.rating)}</span> ${p.rating}`:'—'}</td>
       <td><span class="badge ${p.price_numeric>0?'badge-green':'badge-gray'}">${p.price_numeric>0?'Priced':'Visual'}</span></td>
-      <td><a href="${p.product_link||'#'}" target="_blank" class="btn btn-sm" rel="noopener">Open ↗</a></td>
+      <td style="display:flex;gap:4px">
+        <a href="${p.product_link||'#'}" target="_blank" class="btn btn-sm" rel="noopener">Open ↗</a>
+        <button class="btn btn-sm" onclick="rescrapeProduct(${p.id}, this)">🔄</button>
+      </td>
     </tr>`;
   }).join('');
 }
@@ -884,37 +895,68 @@ async function loadLensResults() {
     const data=await apiFetch(`/searches/${currentSearchId}/lens-results/`);
     allLensResults=data.results||[];
     document.getElementById('lens-session-sub').textContent=`${data.search_keyword} · ${data.counts?.shopping_with_price||0} shopping · ${data.counts?.visual_no_price||0} visual`;
+
+    // Populate website dropdown — same pattern as All Products' filter-website.
+    // Guarded with `if (ws)` so a missing/renamed element degrades gracefully
+    // instead of throwing and silently blanking the whole page via the catch below.
+    const sites=[...new Set(allLensResults.map(r=>r.source||getDomain(r.link||'')).filter(Boolean))].sort();
+    const ws=document.getElementById('lens-filter-website');
+    if (ws) {
+      const cur=ws.value;
+      ws.innerHTML=`<option value="">All websites</option>`+sites.map(s=>`<option value="${s}">${s}</option>`).join('');
+      if(cur) ws.value=cur;
+    }
+
     renderLensResults();
-  } catch { document.getElementById('lens-loading').style.display='none'; document.getElementById('lens-empty').style.display='block'; }
+  } catch(e) {
+    console.error('loadLensResults failed:', e);
+    document.getElementById('lens-loading').style.display='none';
+    document.getElementById('lens-empty').style.display='block';
+  }
 }
+
 function renderLensResults() {
   document.getElementById('lens-loading').style.display='none';
   let f=allLensResults;
   if(lensFilter==='shopping') f=f.filter(r=>r.result_type==='shopping');
   if(lensFilter==='visual') f=f.filter(r=>r.result_type==='visual');
   if(lensFilter==='unscraped') f=f.filter(r=>!r.scraped&&r.result_type==='visual');
+  if(lensWebsiteFilter) f=f.filter(r=>(r.source||getDomain(r.link||'')||'')===lensWebsiteFilter);
   if(!f.length){document.getElementById('lens-grid').innerHTML='';document.getElementById('lens-empty').style.display='block';return;}
   document.getElementById('lens-empty').style.display='none';
   document.getElementById('lens-grid').innerHTML=f.map(r=>{
     const th=r.thumbnail||r.image_url||''; const site=r.source||getDomain(r.link||'')||'—';
+    const displayPrice = r.scraped_price || r.price || (r.result_type==='visual' ? 'No price yet' : '—');
+    const displayRating = r.scraped_rating || r.rating || '';
     return `<div class="product-card">
       <div>${th?`<img class="product-img" src="${th}" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">`:''}
       <div class="product-img-placeholder" style="${th?'display:none':''}">🔍</div></div>
       <div class="product-body">
-        <div style="display:flex;gap:4px;flex-wrap:wrap"><span class="badge ${r.result_type==='shopping'?'badge-green':'badge-blue'}">${r.result_type}</span>${r.scraped?'<span class="badge badge-gray">scraped</span>':''}</div>
+        <div style="display:flex;gap:4px;flex-wrap:wrap">
+          <span class="badge ${r.result_type==='shopping'?'badge-green':'badge-blue'}">${r.result_type}</span>
+          ${r.scraped?'<span class="badge badge-gray">scraped</span>':''}
+        </div>
         <div class="product-source">${site}</div>
         <div class="product-name">${r.title||'—'}</div>
-        <div class="product-meta"><span class="product-price">${r.price||(r.result_type==='visual'?'No price yet':'—')}</span></div>
-        ${r.rating?`<div class="product-rating"><span class="stars">${fmtStars(r.rating)}</span> ${r.rating}${r.reviews?' ('+r.reviews+')':''}</div>`:''}
+        <div class="product-meta"><span class="product-price">${displayPrice}</span></div>
+        ${displayRating?`<div class="product-rating"><span class="stars">${fmtStars(displayRating)}</span> ${displayRating}${r.reviews?' ('+r.reviews+')':''}</div>`:''}
       </div>
-      <div class="product-footer"><div style="display:flex;gap:6px">
+      <div class="product-footer"><div style="display:flex;gap:6px;flex-wrap:wrap">
         <a href="${r.link||'#'}" target="_blank" rel="noopener" class="btn btn-sm" style="flex:1;justify-content:center">Open ↗</a>
         ${r.result_type==='visual'&&!r.scraped?`<button class="btn btn-sm btn-primary" onclick="scrapeSingle(${r.id})">Scrape</button>`:''}
+        ${r.link?`<button class="btn btn-sm" title="Re-check current price" onclick="rescrapeLensResult(${r.id})">🔄 Rescrape</button>`:''}
       </div></div>
+      ${r.product_id?`<div style="padding:0 14px 10px"><span class="badge badge-green">✓ In products</span></div>`:(r.scraped?`<div style="padding:0 14px 10px"><span class="badge badge-gray">Not promoted</span></div>`:'')}
     </div>`;
   }).join('');
 }
 function setLensFilter(v,el){lensFilter=v;document.querySelectorAll('#lens-type-toggle .toggle-item').forEach(t=>t.classList.remove('active'));el.classList.add('active');renderLensResults();}
+
+function applyLensWebsiteFilter() {
+  const el = document.getElementById('lens-filter-website');
+  lensWebsiteFilter = el ? el.value : '';
+  renderLensResults();
+}
 async function scrapeSingle(id){showToast('Scraping #'+id+'...');try{await apiPost(`/lens-results/${id}/scrape/`);showToast('Done!');loadLensResults();}catch{showToast('Scrape failed');}}
 
 // ── Scraper ──────────────────────────────────────────────────────
@@ -1006,6 +1048,143 @@ async function startSearch() {
     setStep(1);
   }
 }
+
+
+
+async function rescrapeProduct(id, btn) {
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = '...';
+  try {
+    const d = await apiPost(`/products/${id}/rescrape/`, {});
+    if (d.success) {
+      showToast(`Price updated: ${d.old_price||'—'} → ${d.price}`);
+      loadProducts();
+    } else if (d.kept_old_data) {
+      showToast('Could not confirm new price — kept existing price');
+    } else {
+      showToast('Rescrape failed: ' + (d.error||'unknown'));
+    }
+  } catch { showToast('Rescrape failed'); }
+  finally { btn.disabled = false; btn.textContent = orig; }
+}
+
+async function rescrapeAllProducts() {
+  if (!currentSearchId) { showToast('No search selected'); return; }
+  showToast('Refreshing all prices... this may take a while');
+  logScrape && logScrape('Refreshing all product prices...');
+  try {
+    const d = await apiPost(`/searches/${currentSearchId}/rescrape-products/`, {});
+    showToast(d.message || `Rescraped ${d.total||0} products`);
+    loadProducts();
+  } catch { showToast('Refresh failed'); }
+}
+
+
+async function runScrapeAll(){
+  const btn=document.getElementById('scrape-all-btn');
+  btn.disabled=true;btn.textContent='...Running';
+  logScrape('Scraping all + auto-saving shopping results...');
+  try{
+    const d=await apiPost(`/searches/${currentSearchId}/scrape/all/`);
+    const promoted = d.auto_promoted?.promoted ?? 0;
+    logScrape(`✓ Done. Auto-promoted ${promoted} shopping results.`);
+    showToast(`Scrape complete — ${promoted} shopping results saved automatically`);
+    loadScrapeInfo();
+  }catch(e){logScrape('✗ '+e.message);showToast('Failed');}
+  finally{btn.disabled=false;btn.textContent='Scrape all';}
+}
+
+async function rescrapeLensResult(id) {
+  showToast('Re-checking price for #'+id+'...');
+  try {
+    const d = await apiPost(`/lens-results/${id}/scrape/`, {force: true});
+    if (d.success) {
+      showToast(d.promoted ? `Updated & in products: ${d.price}` : 'Rescraped, but not promoted');
+    } else if (d.kept_old_data) {
+      showToast('Site blocked the check — kept existing price');
+    } else {
+      showToast('Rescrape failed: ' + (d.error||'unknown'));
+    }
+    loadLensResults();
+  } catch { showToast('Rescrape failed'); }
+}
+
+
+// function setLensView(mode, el) {
+//   lensViewMode = mode;
+//   document.querySelectorAll('#lens-view-toggle .toggle-item').forEach(t=>t.classList.remove('active'));
+//   el.classList.add('active');
+//   renderLensResults();
+// }
+
+// function renderLensResultsByWebsite(items) {
+//   // Group filtered items by site (source, falling back to domain from link)
+//   const groups = {};
+//   for (const r of items) {
+//     const site = r.source || getDomain(r.link||'') || 'Other';
+//     if (!groups[site]) groups[site] = [];
+//     groups[site].push(r);
+//   }
+//   const siteNames = Object.keys(groups).sort((a,b)=>groups[b].length-groups[a].length);
+
+//   document.getElementById('lens-grid').innerHTML = siteNames.map(site => {
+//     const rows = groups[site];
+//     const priced = rows.filter(r=>r.scraped_price||r.price).length;
+//     const cardsHtml = rows.map(r => renderLensCard(r)).join('');
+//     return `
+//       <div style="grid-column:1/-1;margin-top:8px">
+//         <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid var(--border)">
+//           <span style="font-size:14px;font-weight:600;color:var(--text-primary)">${site}</span>
+//           <span class="badge badge-gray">${rows.length} item${rows.length!==1?'s':''}</span>
+//           ${priced?`<span class="badge badge-green">${priced} priced</span>`:''}
+//         </div>
+//         <div class="product-grid" style="margin-bottom:20px">${cardsHtml}</div>
+//       </div>
+//     `;
+//   }).join('');
+// }
+
+// function renderLensCard(r) {
+//   const th=r.thumbnail||r.image_url||''; const site=r.source||getDomain(r.link||'')||'—';
+//   const displayPrice = r.scraped_price || r.price || (r.result_type==='visual' ? 'No price yet' : '—');
+//   const displayRating = r.scraped_rating || r.rating || '';
+//   return `<div class="product-card">
+//     <div>${th?`<img class="product-img" src="${th}" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">`:''}
+//     <div class="product-img-placeholder" style="${th?'display:none':''}">🔍</div></div>
+//     <div class="product-body">
+//       <div style="display:flex;gap:4px;flex-wrap:wrap">
+//         <span class="badge ${r.result_type==='shopping'?'badge-green':'badge-blue'}">${r.result_type}</span>
+//         ${r.scraped?'<span class="badge badge-gray">scraped</span>':''}
+//       </div>
+//       <div class="product-source">${site}</div>
+//       <div class="product-name">${r.title||'—'}</div>
+//       <div class="product-meta"><span class="product-price">${displayPrice}</span></div>
+//       ${displayRating?`<div class="product-rating"><span class="stars">${fmtStars(displayRating)}</span> ${displayRating}${r.reviews?' ('+r.reviews+')':''}</div>`:''}
+//     </div>
+//     <div class="product-footer"><div style="display:flex;gap:6px;flex-wrap:wrap">
+//       <a href="${r.link||'#'}" target="_blank" rel="noopener" class="btn btn-sm" style="flex:1;justify-content:center">Open ↗</a>
+//       ${r.result_type==='visual'&&!r.scraped?`<button class="btn btn-sm btn-primary" onclick="scrapeSingle(${r.id})">Scrape</button>`:''}
+//       ${r.link?`<button class="btn btn-sm" title="Re-check current price" onclick="rescrapeLensResult(${r.id})">🔄 Rescrape</button>`:''}
+//     </div></div>
+//     ${r.product_id?`<div style="padding:0 14px 10px"><span class="badge badge-green">✓ In products</span></div>`:(r.scraped?`<div style="padding:0 14px 10px"><span class="badge badge-gray">Not promoted</span></div>`:'')}
+//   </div>`;
+// }
+
+// function renderLensResults() {
+//   document.getElementById('lens-loading').style.display='none';
+//   let f=allLensResults;
+//   if(lensFilter==='shopping') f=f.filter(r=>r.result_type==='shopping');
+//   if(lensFilter==='visual') f=f.filter(r=>r.result_type==='visual');
+//   if(lensFilter==='unscraped') f=f.filter(r=>!r.scraped&&r.result_type==='visual');
+//   if(!f.length){document.getElementById('lens-grid').innerHTML='';document.getElementById('lens-empty').style.display='block';return;}
+//   document.getElementById('lens-empty').style.display='none';
+
+//   if (lensViewMode === 'website') {
+//     renderLensResultsByWebsite(f);
+//   } else {
+//     document.getElementById('lens-grid').innerHTML = f.map(r => renderLensCard(r)).join('');
+//   }
+// }
 
 // ── Init ─────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', () => {

@@ -7,12 +7,15 @@ Targets:
     product_name  : #productTitle
     price         : .a-price-whole  (current price)
     discount      : .savingsPercentage
-    rating        : .a-icon-alt or #acrPopupText
+    rating        : scoped to #acrPopover / review summary block
+                    (NOT the bare .a-icon-alt, which matches unrelated
+                    icons like pagination "Previous"/"Next" controls)
     reviews       : #acrCustomerReviewText
     product_image : #landingImage (data-old-hires or src)
     delivery      : #mir-layout-DELIVERY_BLOCK
 """
 
+import re
 from bs4 import BeautifulSoup
 from .base import BaseScraper
 
@@ -32,14 +35,12 @@ class AmazonScraper(BaseScraper):
         product_name = name_el.get_text(strip=True) if name_el else ""
 
         # ── Price ─────────────────────────────────────────────────
-        # Primary: .a-price-whole (excludes paise — add .a-price-fraction if needed)
         price_el = soup.select_one(".a-price-whole")
         price = ""
         if price_el:
             fraction_el = soup.select_one(".a-price-fraction")
             fraction    = fraction_el.get_text(strip=True) if fraction_el else "00"
             price       = f"₹{price_el.get_text(strip=True)}.{fraction}"
-        # Fallback: #priceblock_ourprice (older Amazon layout)
         if not price:
             fb = soup.select_one("#priceblock_ourprice, #priceblock_dealprice")
             if fb:
@@ -52,17 +53,27 @@ class AmazonScraper(BaseScraper):
         discount = discount_el.get_text(strip=True) if discount_el else ""
 
         # ── Rating ────────────────────────────────────────────────
+        # Scoped to the review-summary block — bare ".a-icon-alt" also
+        # matches unrelated icons (e.g. carousel "Previous"/"Next"
+        # controls), which was silently grabbing the wrong element.
         rating = ""
-        rating_el = soup.select_one(".a-icon-alt")
+        rating_el = soup.select_one(
+            "#acrPopover .a-icon-alt, "
+            "span[data-hook='rating-out-of-text'], "
+            "i[data-hook='average-star-rating'] .a-icon-alt"
+        )
+        if not rating_el:
+            review_block = soup.select_one("#averageCustomerReviews, #reviewsMedley")
+            if review_block:
+                rating_el = review_block.select_one(".a-icon-alt")
         if rating_el:
-            # "4.2 out of 5 stars" -> "4.2"
             raw = rating_el.get_text(strip=True)
-            rating = raw.split(" ")[0] if raw else ""
+            match = re.search(r"(\d+\.?\d*)\s*out of", raw)
+            rating = match.group(1) if match else ""
 
         # ── Reviews ───────────────────────────────────────────────
         reviews_el = soup.select_one("#acrCustomerReviewText")
         reviews = reviews_el.get_text(strip=True) if reviews_el else ""
-        # Strip " ratings" suffix
         reviews = reviews.replace(" ratings", "").replace(" rating", "").strip()
 
         # ── Product image ─────────────────────────────────────────
@@ -75,7 +86,7 @@ class AmazonScraper(BaseScraper):
                 img_el.get("src", "")
             )
 
-        # ── Delivery ─────────────────────────────────────────────
+        # ── Delivery ──────────────────────────────────────────────
         delivery_el = soup.select_one("#mir-layout-DELIVERY_BLOCK span[data-csa-c-content-id]")
         if not delivery_el:
             delivery_el = soup.select_one(".delivery-message, #deliveryMessageMirId")

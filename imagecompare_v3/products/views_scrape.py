@@ -21,7 +21,10 @@ from .scrapers.runner import (
     scrape_batch,
     scrape_all_for_search,
     scrape_one,
-    retry_failed,          # ← this was missing from runner.py, causing ImportError → HTML 500
+    retry_failed,
+    rescrape_one,
+    rescrape_all_products,
+    rescrape_lens_result,
 )
 
 
@@ -139,26 +142,6 @@ class RetryFailedScrapeView(APIView):
         }, status=status.HTTP_200_OK)
 
 
-class ScrapeSingleResultView(APIView):
-    """POST /api/lens-results/<id>/scrape/   Body: {force: true} to retry"""
-    def post(self, request, pk):
-        try:
-            lr = GoogleLensResult.objects.get(pk=pk)
-        except GoogleLensResult.DoesNotExist:
-            return Response({"error": f"GoogleLensResult id={pk} not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        if lr.scraped and request.data.get("force"):
-            lr.scraped = False
-            lr.save(update_fields=["scraped"])
-
-        result = scrape_one(lr.id)
-        return Response({
-            "lens_result_id": lr.id,
-            "url"           : lr.link,
-            "source"        : lr.source,
-            "result_type"   : lr.result_type,
-            **result,
-        }, status=status.HTTP_200_OK if result.get("success") else status.HTTP_422_UNPROCESSABLE_ENTITY)
 
 
 class SearchProductsView(APIView):
@@ -192,3 +175,66 @@ class SearchProductsView(APIView):
             "by_website"    : by_website,
             "products"      : serializer.data,
         })
+
+
+
+
+class RescrapeProductView(APIView):
+    """POST /api/products/<id>/rescrape/  — refresh price for one product"""
+    def post(self, request, pk):
+        try:
+            Product.objects.get(pk=pk)
+        except Product.DoesNotExist:
+            return Response({"error": f"Product id={pk} not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        result = rescrape_one(pk)
+        return Response(result, status=status.HTTP_200_OK if result.get("success") else status.HTTP_422_UNPROCESSABLE_ENTITY)
+
+
+class RescrapeAllProductsView(APIView):
+    """POST /api/searches/<id>/rescrape-products/ — refresh prices for every product in a search"""
+    def post(self, request, pk):
+        try:
+            search = SearchHistory.objects.get(pk=pk)
+        except SearchHistory.DoesNotExist:
+            return Response({"error": f"Search id={pk} not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        total = Product.objects.filter(search_id=pk).count()
+        if total == 0:
+            return Response({
+                "message"  : "No products to rescrape yet.",
+                "search_id": pk,
+                "total"    : 0,
+            })
+
+        result = rescrape_all_products(search.id)
+        return Response({
+            **result,
+            "message": (
+                f"Rescraped {result['total']} products. "
+                f"{result['success']} updated, {result['failed']} failed."
+            ),
+        }, status=status.HTTP_200_OK)
+    
+
+
+class ScrapeSingleResultView(APIView):
+    """POST /api/lens-results/<id>/scrape/   Body: {force: true} to rescrape"""
+    def post(self, request, pk):
+        try:
+            lr = GoogleLensResult.objects.get(pk=pk)
+        except GoogleLensResult.DoesNotExist:
+            return Response({"error": f"GoogleLensResult id={pk} not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if request.data.get("force"):
+            result = rescrape_lens_result(lr.id)   # ← force path now shared logic
+        else:
+            result = scrape_one(lr.id)
+
+        return Response({
+            "lens_result_id": lr.id,
+            "url"           : lr.link,
+            "source"        : lr.source,
+            "result_type"   : lr.result_type,
+            **result,
+        }, status=status.HTTP_200_OK if result.get("success") else status.HTTP_422_UNPROCESSABLE_ENTITY)
