@@ -4,8 +4,7 @@
 # ── Install order ────────────────────────────────────────────────
 #
 #  Step 1  PyTorch CPU (run first, separately)
-#          python -m pip install torch==2.3.1+cpu torchvision==0.18.1+cpu \
-#            --index-url https://download.pytorch.org/whl/cpu
+#          python -m pip install torch==2.3.1+cpu torchvision==0.18.1+cpu --index-url https://download.pytorch.org/whl/cpu
 #
 #  Step 2  FashionCLIP (run second, separately)
 #          python -m pip install git+https://github.com/patrickjohncyh/fashion-clip.git
@@ -70,3 +69,4 @@ beautifulsoup4==4.12.3
 lxml==5.2.2
 
 gunicorn==22.0.0
+webdriver-manager==4.1.2
