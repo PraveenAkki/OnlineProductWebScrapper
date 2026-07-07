@@ -477,13 +477,27 @@ def classify(image_path: str) -> dict:
 
     own_url = _get_own_site_public_url(image_path)
     if own_url:
-        try:
-            _verify_public_image_url(own_url)
+        # IMPORTANT: do NOT verify this URL with a network call back to our
+        # own server (as we do for catbox.moe/tmpfiles.org below). On a
+        # single-gunicorn-worker deployment (WEB_CONCURRENCY=1, which Render
+        # sets by default on small instances), the current request handler
+        # IS that one worker — a synchronous self-request has no free
+        # worker to answer it and will always time out, deadlocking every
+        # single time, regardless of whether the URL actually works.
+        #
+        # We don't need to self-verify anyway: we just saved this file
+        # ourselves in this same request, so we already know it exists.
+        # What matters is whether SerpAPI's crawler (an entirely separate,
+        # external process) can reach it — and that's something only an
+        # external fetch can actually test. If it can't, SerpAPI's
+        # "Fully empty" / no-results response (already handled above with
+        # retries) will tell us so, with no deadlock risk.
+        if os.path.exists(image_path):
             public_url = own_url
-            print(f"[GoogleLens] Using own site's public media URL (no third-party host needed): {own_url}")
-        except Exception as e:
-            upload_errors.append(f"own site URL ({own_url}): {e}")
-            print(f"[GoogleLens] Own site URL failed verification ({e}); falling back to third-party hosts...")
+            print(f"[GoogleLens] Using own site's public media URL (skipping self-verification to avoid single-worker deadlock): {own_url}")
+        else:
+            upload_errors.append(f"own site URL ({own_url}): local file not found at {image_path}")
+            print(f"[GoogleLens] Own site URL skipped — local file not found at {image_path}")
     else:
         print("[GoogleLens] No PUBLIC_SITE_URL/RENDER_EXTERNAL_URL configured or image not under MEDIA_ROOT — using third-party hosts.")
 
